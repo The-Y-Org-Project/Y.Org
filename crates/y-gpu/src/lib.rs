@@ -23,6 +23,11 @@ pub struct Renderer {
     device: ash::Device,
     swapchain_loader: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    image_available: vk::Semaphore,
+    render_finished: Vec<vk::Semaphore>,
+    in_flight: vk::Fence,
     pub images: Vec<vk::Image>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
@@ -181,10 +186,36 @@ impl GpuContext {
         let swapchain = unsafe { swapchain_loader.create_swapchain(&swap_info, None)? };
         let images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
 
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None)? };
+
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffer = unsafe { device.allocate_command_buffers(&alloc_info)?[0] };
+
+        let sem_info = vk::SemaphoreCreateInfo::default();
+        let image_available = unsafe { device.create_semaphore(&sem_info, None)? };
+        let mut render_finished = Vec::with_capacity(images.len());
+        for _ in 0..images.len() {
+            render_finished.push(unsafe { device.create_semaphore(&sem_info, None)? });
+        }
+
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let in_flight = unsafe { device.create_fence(&fence_info, None)? };
+
         Ok(Renderer {
             device,
             swapchain_loader,
             swapchain,
+            command_pool,
+            command_buffer,
+            image_available,
+            render_finished,
+            in_flight,
             images,
             format: format.format,
             extent,
@@ -195,10 +226,130 @@ impl GpuContext {
     }
 }
 
+impl Renderer {
+    pub fn draw_clear(&self, color: [f32; 4]) -> Result<()> {
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.in_flight], true, u64::MAX)?;
+
+            let (index, _) = match self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                self.image_available,
+                vk::Fence::null(),
+            ) {
+                Ok(v) => v,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+
+            self.device.reset_fences(&[self.in_flight])?;
+
+            let image = self.images[index as usize];
+            let finished = self.render_finished[index as usize];
+            let cb = self.command_buffer;
+
+            self.device
+                .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device.begin_command_buffer(cb, &begin_info)?;
+
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range);
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_transfer],
+            );
+
+            let clear = vk::ClearColorValue { float32: color };
+            self.device.cmd_clear_color_image(
+                cb,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear,
+                &[range],
+            );
+
+            let to_present = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range);
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+
+            self.device.end_command_buffer(cb)?;
+
+            let wait_semaphores = [self.image_available];
+            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+            let command_buffers = [cb];
+            let signal_semaphores = [finished];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+            self.device
+                .queue_submit(self.queue, &[submit], self.in_flight)?;
+
+            let swapchains = [self.swapchain];
+            let indices = [index];
+            let present = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signal_semaphores)
+                .swapchains(&swapchains)
+                .image_indices(&indices);
+            match self.swapchain_loader.queue_present(self.queue, &present) {
+                Ok(_) => {}
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.device.destroy_fence(self.in_flight, None);
+            for &s in &self.render_finished {
+                self.device.destroy_semaphore(s, None);
+            }
+            self.device.destroy_semaphore(self.image_available, None);
+            self.device.destroy_command_pool(self.command_pool, None);
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
             self.device.destroy_device(None);

@@ -5,6 +5,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 use y_gpu::{GpuContext, Renderer, Surface};
 
+const BACKGROUND: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
 struct App {
     renderer: Option<Renderer>,
     surface: Option<Surface>,
@@ -49,15 +51,30 @@ impl ApplicationHandler for App {
             renderer.images.len(),
         );
 
+        window.request_redraw();
+
         self.renderer = Some(renderer);
         self.surface = Some(surface);
         self.window = Some(window);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if let WindowEvent::CloseRequested = event {
-            println!("Y: fechando...");
-            event_loop.exit();
+        match event {
+            WindowEvent::CloseRequested => {
+                println!("Y: fechando...");
+                event_loop.exit();
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(renderer) = &self.renderer {
+                    renderer
+                        .draw_clear(BACKGROUND)
+                        .expect("falha ao desenhar o quadro");
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            _ => {}
         }
     }
 }
