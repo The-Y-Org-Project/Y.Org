@@ -2,6 +2,8 @@ use y_gpu::Vertex;
 
 const TITLE_BAR_HEIGHT: f32 = 28.0;
 const TITLE_BAR_SHADE: f32 = 0.55;
+const TEXTURE_SIZE: f32 = 64.0;
+const SOLID_TEXEL: [f32; 2] = [0.5 / TEXTURE_SIZE, 0.5 / TEXTURE_SIZE];
 
 pub struct Window {
     pub id: u32,
@@ -68,14 +70,21 @@ impl WindowStack {
                 w.color[1] * TITLE_BAR_SHADE,
                 w.color[2] * TITLE_BAR_SHADE,
             ];
-            push_rect(&mut out, w.x, w.y, w.width, TITLE_BAR_HEIGHT, title_color);
             push_rect(
                 &mut out,
-                w.x,
-                w.y + TITLE_BAR_HEIGHT,
-                w.width,
-                w.height - TITLE_BAR_HEIGHT,
+                [w.x, w.y, w.width, TITLE_BAR_HEIGHT],
+                title_color,
+                SOLID_TEXEL,
+                SOLID_TEXEL,
+            );
+
+            let body_height = w.height - TITLE_BAR_HEIGHT;
+            push_rect(
+                &mut out,
+                [w.x, w.y + TITLE_BAR_HEIGHT, w.width, body_height],
                 w.color,
+                [0.0, 0.0],
+                [w.width / TEXTURE_SIZE, body_height / TEXTURE_SIZE],
             );
         }
 
@@ -83,10 +92,11 @@ impl WindowStack {
     }
 }
 
-fn push_rect(out: &mut Vec<Vertex>, x: f32, y: f32, w: f32, h: f32, color: [f32; 3]) {
-    let tl = Vertex::new([x, y], color);
-    let tr = Vertex::new([x + w, y], color);
-    let br = Vertex::new([x + w, y + h], color);
-    let bl = Vertex::new([x, y + h], color);
+fn push_rect(out: &mut Vec<Vertex>, rect: [f32; 4], color: [f32; 3], uv0: [f32; 2], uv1: [f32; 2]) {
+    let [x, y, w, h] = rect;
+    let tl = Vertex::textured([x, y], color, [uv0[0], uv0[1]]);
+    let tr = Vertex::textured([x + w, y], color, [uv1[0], uv0[1]]);
+    let br = Vertex::textured([x + w, y + h], color, [uv1[0], uv1[1]]);
+    let bl = Vertex::textured([x, y + h], color, [uv0[0], uv1[1]]);
     out.extend_from_slice(&[tl, tr, br, tl, br, bl]);
 }

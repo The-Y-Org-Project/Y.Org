@@ -1,6 +1,9 @@
+mod texture;
+
 use ash::{Entry, Instance, khr, vk};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::mem::offset_of;
+use texture::Texture;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -11,11 +14,20 @@ const MAX_VERTICES: usize = 16384;
 pub struct Vertex {
     pub pos: [f32; 2],
     pub color: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 impl Vertex {
     pub const fn new(pos: [f32; 2], color: [f32; 3]) -> Self {
-        Self { pos, color }
+        Self {
+            pos,
+            color,
+            uv: [0.0, 0.0],
+        }
+    }
+
+    pub const fn textured(pos: [f32; 2], color: [f32; 3], uv: [f32; 2]) -> Self {
+        Self { pos, color, uv }
     }
 }
 
@@ -38,9 +50,11 @@ pub struct Surface {
 pub struct Renderer {
     device: ash::Device,
     phys: vk::PhysicalDevice,
+    mem_props: vk::PhysicalDeviceMemoryProperties,
     swapchain_loader: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     render_pass: vk::RenderPass,
+    set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     image_views: Vec<vk::ImageView>,
@@ -54,6 +68,7 @@ pub struct Renderer {
     vertex_memory: vk::DeviceMemory,
     vertex_ptr: *mut u8,
     vertex_count: u32,
+    texture: Texture,
     pub images: Vec<vk::Image>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
@@ -73,6 +88,20 @@ struct VertexStorage {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     ptr: *mut u8,
+}
+
+fn checker_pixels() -> (u32, u32, Vec<u8>) {
+    let size = 64u32;
+    let cell = 8u32;
+    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let light = (x / cell + y / cell) % 2 == 0;
+            let v = if light { 255u8 } else { 217u8 };
+            pixels.extend_from_slice(&[v, v, v, 255]);
+        }
+    }
+    (size, size, pixels)
 }
 
 fn build_swapchain(
@@ -188,6 +217,7 @@ fn load_shader(device: &ash::Device, bytes: &[u8]) -> Result<vk::ShaderModule> {
 fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
+    set_layout: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
     let vert = load_shader(device, include_bytes!("../shaders/basic.vert.spv"))?;
     let frag = load_shader(device, include_bytes!("../shaders/basic.frag.spv"))?;
@@ -218,6 +248,11 @@ fn create_pipeline(
             .binding(0)
             .format(vk::Format::R32G32B32_SFLOAT)
             .offset(offset_of!(Vertex, color) as u32),
+        vk::VertexInputAttributeDescription::default()
+            .location(2)
+            .binding(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(offset_of!(Vertex, uv) as u32),
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)
@@ -247,7 +282,10 @@ fn create_pipeline(
         .stage_flags(vk::ShaderStageFlags::VERTEX)
         .offset(0)
         .size(8)];
-    let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges);
+    let set_layouts = [set_layout];
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&set_layouts)
+        .push_constant_ranges(&push_ranges);
     let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
 
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
@@ -314,7 +352,7 @@ fn build_targets(
     Ok((views, framebuffers))
 }
 
-fn find_memory_type(
+pub(crate) fn find_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     flags: vk::MemoryPropertyFlags,
@@ -472,7 +510,8 @@ impl GpuContext {
         )?;
 
         let render_pass = create_render_pass(&device, parts.format)?;
-        let (pipeline_layout, pipeline) = create_pipeline(&device, render_pass)?;
+        let set_layout = texture::create_set_layout(&device)?;
+        let (pipeline_layout, pipeline) = create_pipeline(&device, render_pass, set_layout)?;
         let (image_views, framebuffers) = build_targets(
             &device,
             render_pass,
@@ -504,12 +543,26 @@ impl GpuContext {
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
         let in_flight = unsafe { device.create_fence(&fence_info, None)? };
 
+        let (tex_w, tex_h, tex_pixels) = checker_pixels();
+        let texture = Texture::new(
+            &device,
+            &mem_props,
+            queue,
+            command_pool,
+            set_layout,
+            tex_w,
+            tex_h,
+            &tex_pixels,
+        )?;
+
         Ok(Renderer {
             device,
             phys,
+            mem_props,
             swapchain_loader,
             swapchain: parts.swapchain,
             render_pass,
+            set_layout,
             pipeline_layout,
             pipeline,
             image_views,
@@ -523,6 +576,7 @@ impl GpuContext {
             vertex_memory: storage.memory,
             vertex_ptr: storage.ptr,
             vertex_count: 0,
+            texture,
             images: parts.images,
             format: parts.format,
             extent: parts.extent,
@@ -534,6 +588,23 @@ impl GpuContext {
 }
 
 impl Renderer {
+    pub fn set_texture(&mut self, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
+        let texture = Texture::new(
+            &self.device,
+            &self.mem_props,
+            self.queue,
+            self.command_pool,
+            self.set_layout,
+            width,
+            height,
+            pixels,
+        )?;
+        unsafe { self.device.device_wait_idle()? };
+        let old = std::mem::replace(&mut self.texture, texture);
+        old.destroy(&self.device);
+        Ok(())
+    }
+
     pub fn set_vertices(&mut self, vertices: &[Vertex]) -> Result<()> {
         if vertices.len() > MAX_VERTICES {
             return Err("too many vertices for the vertex buffer".into());
@@ -651,6 +722,14 @@ impl Renderer {
 
             self.device
                 .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[self.texture.set],
+                &[],
+            );
 
             let viewport = vk::Viewport {
                 x: 0.0,
@@ -666,6 +745,7 @@ impl Renderer {
             };
             self.device.cmd_set_viewport(cb, 0, &[viewport]);
             self.device.cmd_set_scissor(cb, 0, &[scissor]);
+
             let mut resolution = [0u8; 8];
             resolution[..4].copy_from_slice(&(self.extent.width as f32).to_ne_bytes());
             resolution[4..].copy_from_slice(&(self.extent.height as f32).to_ne_bytes());
@@ -676,6 +756,7 @@ impl Renderer {
                 0,
                 &resolution,
             );
+
             self.device
                 .cmd_bind_vertex_buffers(cb, 0, &[self.vertex_buffer], &[0]);
             self.device.cmd_draw(cb, self.vertex_count, 1, 0, 0);
@@ -715,6 +796,7 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.texture.destroy(&self.device);
             self.device.unmap_memory(self.vertex_memory);
             self.device.destroy_buffer(self.vertex_buffer, None);
             self.device.free_memory(self.vertex_memory, None);
@@ -733,6 +815,8 @@ impl Drop for Renderer {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.set_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
