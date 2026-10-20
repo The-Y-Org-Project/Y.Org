@@ -21,6 +21,7 @@ pub struct Surface {
 
 pub struct Renderer {
     device: ash::Device,
+    phys: vk::PhysicalDevice,
     swapchain_loader: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     command_pool: vk::CommandPool,
@@ -34,6 +35,83 @@ pub struct Renderer {
     pub queue: vk::Queue,
     pub queue_family: u32,
     pub gpu_name: String,
+}
+
+struct SwapchainParts {
+    swapchain: vk::SwapchainKHR,
+    images: Vec<vk::Image>,
+    format: vk::Format,
+    extent: vk::Extent2D,
+}
+
+fn build_swapchain(
+    surface: &Surface,
+    swapchain_loader: &khr::swapchain::Device,
+    phys: vk::PhysicalDevice,
+    size: (u32, u32),
+    old: vk::SwapchainKHR,
+) -> Result<SwapchainParts> {
+    let caps = unsafe {
+        surface
+            .loader
+            .get_physical_device_surface_capabilities(phys, surface.raw)?
+    };
+    let formats = unsafe {
+        surface
+            .loader
+            .get_physical_device_surface_formats(phys, surface.raw)?
+    };
+    let format = formats
+        .iter()
+        .copied()
+        .find(|f| {
+            f.format == vk::Format::B8G8R8A8_UNORM
+                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+        })
+        .unwrap_or(formats[0]);
+
+    let extent = if caps.current_extent.width != u32::MAX {
+        caps.current_extent
+    } else {
+        vk::Extent2D {
+            width: size
+                .0
+                .clamp(caps.min_image_extent.width, caps.max_image_extent.width),
+            height: size
+                .1
+                .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
+        }
+    };
+
+    let mut image_count = caps.min_image_count + 1;
+    if caps.max_image_count > 0 && image_count > caps.max_image_count {
+        image_count = caps.max_image_count;
+    }
+
+    let info = vk::SwapchainCreateInfoKHR::default()
+        .surface(surface.raw)
+        .min_image_count(image_count)
+        .image_format(format.format)
+        .image_color_space(format.color_space)
+        .image_extent(extent)
+        .image_array_layers(1)
+        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
+        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .pre_transform(caps.current_transform)
+        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+        .present_mode(vk::PresentModeKHR::FIFO)
+        .clipped(true)
+        .old_swapchain(old);
+
+    let swapchain = unsafe { swapchain_loader.create_swapchain(&info, None)? };
+    let images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
+
+    Ok(SwapchainParts {
+        swapchain,
+        images,
+        format: format.format,
+        extent,
+    })
 }
 
 impl GpuContext {
@@ -132,59 +210,13 @@ impl GpuContext {
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
         let swapchain_loader = khr::swapchain::Device::new(&self.instance, &device);
-        let caps = unsafe {
-            surface
-                .loader
-                .get_physical_device_surface_capabilities(phys, surface.raw)?
-        };
-        let formats = unsafe {
-            surface
-                .loader
-                .get_physical_device_surface_formats(phys, surface.raw)?
-        };
-        let format = formats
-            .iter()
-            .copied()
-            .find(|f| {
-                f.format == vk::Format::B8G8R8A8_UNORM
-                    && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-            })
-            .unwrap_or(formats[0]);
-
-        let extent = if caps.current_extent.width != u32::MAX {
-            caps.current_extent
-        } else {
-            vk::Extent2D {
-                width: size
-                    .0
-                    .clamp(caps.min_image_extent.width, caps.max_image_extent.width),
-                height: size
-                    .1
-                    .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
-            }
-        };
-
-        let mut image_count = caps.min_image_count + 1;
-        if caps.max_image_count > 0 && image_count > caps.max_image_count {
-            image_count = caps.max_image_count;
-        }
-
-        let swap_info = vk::SwapchainCreateInfoKHR::default()
-            .surface(surface.raw)
-            .min_image_count(image_count)
-            .image_format(format.format)
-            .image_color_space(format.color_space)
-            .image_extent(extent)
-            .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
-            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .pre_transform(caps.current_transform)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
-            .clipped(true);
-
-        let swapchain = unsafe { swapchain_loader.create_swapchain(&swap_info, None)? };
-        let images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
+        let parts = build_swapchain(
+            surface,
+            &swapchain_loader,
+            phys,
+            size,
+            vk::SwapchainKHR::null(),
+        )?;
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
@@ -199,8 +231,8 @@ impl GpuContext {
 
         let sem_info = vk::SemaphoreCreateInfo::default();
         let image_available = unsafe { device.create_semaphore(&sem_info, None)? };
-        let mut render_finished = Vec::with_capacity(images.len());
-        for _ in 0..images.len() {
+        let mut render_finished = Vec::with_capacity(parts.images.len());
+        for _ in 0..parts.images.len() {
             render_finished.push(unsafe { device.create_semaphore(&sem_info, None)? });
         }
 
@@ -209,16 +241,17 @@ impl GpuContext {
 
         Ok(Renderer {
             device,
+            phys,
             swapchain_loader,
-            swapchain,
+            swapchain: parts.swapchain,
             command_pool,
             command_buffer,
             image_available,
             render_finished,
             in_flight,
-            images,
-            format: format.format,
-            extent,
+            images: parts.images,
+            format: parts.format,
+            extent: parts.extent,
             queue,
             queue_family,
             gpu_name,
@@ -227,7 +260,44 @@ impl GpuContext {
 }
 
 impl Renderer {
-    pub fn draw_clear(&self, color: [f32; 4]) -> Result<()> {
+    pub fn resize(&mut self, surface: &Surface, size: (u32, u32)) -> Result<()> {
+        if size.0 == 0 || size.1 == 0 {
+            return Ok(());
+        }
+
+        unsafe { self.device.device_wait_idle()? };
+
+        let parts = build_swapchain(
+            surface,
+            &self.swapchain_loader,
+            self.phys,
+            size,
+            self.swapchain,
+        )?;
+
+        unsafe {
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
+            for &s in &self.render_finished {
+                self.device.destroy_semaphore(s, None);
+            }
+        }
+
+        let sem_info = vk::SemaphoreCreateInfo::default();
+        let mut render_finished = Vec::with_capacity(parts.images.len());
+        for _ in 0..parts.images.len() {
+            render_finished.push(unsafe { self.device.create_semaphore(&sem_info, None)? });
+        }
+
+        self.swapchain = parts.swapchain;
+        self.images = parts.images;
+        self.format = parts.format;
+        self.extent = parts.extent;
+        self.render_finished = render_finished;
+        Ok(())
+    }
+
+    pub fn draw_clear(&self, color: [f32; 4]) -> Result<bool> {
         let range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -236,7 +306,7 @@ impl Renderer {
             layer_count: 1,
         };
 
-        unsafe {
+        let stale = unsafe {
             self.device
                 .wait_for_fences(&[self.in_flight], true, u64::MAX)?;
 
@@ -247,7 +317,7 @@ impl Renderer {
                 vk::Fence::null(),
             ) {
                 Ok(v) => v,
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(()),
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(true),
                 Err(e) => return Err(e.into()),
             };
 
@@ -331,12 +401,12 @@ impl Renderer {
                 .swapchains(&swapchains)
                 .image_indices(&indices);
             match self.swapchain_loader.queue_present(self.queue, &present) {
-                Ok(_) => {}
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {}
+                Ok(_) => false,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => true,
                 Err(e) => return Err(e.into()),
             }
-        }
-        Ok(())
+        };
+        Ok(stale)
     }
 }
 

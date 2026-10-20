@@ -15,6 +15,19 @@ struct App {
     display: RawDisplayHandle,
 }
 
+impl App {
+    fn resize_to_window(&mut self) {
+        if let (Some(renderer), Some(surface), Some(window)) =
+            (&mut self.renderer, &self.surface, &self.window)
+        {
+            let size = window.inner_size();
+            renderer
+                .resize(surface, (size.width, size.height))
+                .expect("failed to resize swapchain");
+        }
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -67,11 +80,18 @@ impl ApplicationHandler for App {
                 println!("Y: shutting down...");
                 event_loop.exit();
             }
+            WindowEvent::Resized(_) => {
+                self.resize_to_window();
+            }
             WindowEvent::RedrawRequested => {
-                if let Some(renderer) = &self.renderer {
-                    renderer
+                let stale = match &self.renderer {
+                    Some(renderer) => renderer
                         .draw_clear(BACKGROUND)
-                        .expect("failed to draw frame");
+                        .expect("failed to draw frame"),
+                    None => false,
+                };
+                if stale {
+                    self.resize_to_window();
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
