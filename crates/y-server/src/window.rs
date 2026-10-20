@@ -40,6 +40,25 @@ impl WindowStack {
         }
     }
 
+    pub fn hit_test(&self, px: f32, py: f32) -> Option<(u32, bool)> {
+        self.windows
+            .iter()
+            .rev()
+            .find(|w| px >= w.x && px < w.x + w.width && py >= w.y && py < w.y + w.height)
+            .map(|w| (w.id, py < w.y + TITLE_BAR_HEIGHT))
+    }
+
+    pub fn position(&self, id: u32) -> Option<(f32, f32)> {
+        self.windows.iter().find(|w| w.id == id).map(|w| (w.x, w.y))
+    }
+
+    pub fn move_to(&mut self, id: u32, x: f32, y: f32) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.x = x;
+            w.y = y;
+        }
+    }
+
     pub fn vertices(&self) -> Vec<Vertex> {
         let mut out = Vec::with_capacity(self.windows.len() * 12);
 
