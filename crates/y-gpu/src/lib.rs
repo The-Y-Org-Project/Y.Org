@@ -1,7 +1,23 @@
 use ash::{Entry, Instance, khr, vk};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use std::mem::offset_of;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const MAX_VERTICES: usize = 16384;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Vertex {
+    pub pos: [f32; 2],
+    pub color: [f32; 3],
+}
+
+impl Vertex {
+    pub const fn new(pos: [f32; 2], color: [f32; 3]) -> Self {
+        Self { pos, color }
+    }
+}
 
 pub struct GpuInfo {
     pub name: String,
@@ -34,6 +50,10 @@ pub struct Renderer {
     image_available: vk::Semaphore,
     render_finished: Vec<vk::Semaphore>,
     in_flight: vk::Fence,
+    vertex_buffer: vk::Buffer,
+    vertex_memory: vk::DeviceMemory,
+    vertex_ptr: *mut u8,
+    vertex_count: u32,
     pub images: Vec<vk::Image>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
@@ -47,6 +67,12 @@ struct SwapchainParts {
     images: Vec<vk::Image>,
     format: vk::Format,
     extent: vk::Extent2D,
+}
+
+struct VertexStorage {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
 }
 
 fn build_swapchain(
@@ -163,8 +189,8 @@ fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
-    let vert = load_shader(device, include_bytes!("../shaders/triangle.vert.spv"))?;
-    let frag = load_shader(device, include_bytes!("../shaders/triangle.frag.spv"))?;
+    let vert = load_shader(device, include_bytes!("../shaders/basic.vert.spv"))?;
+    let frag = load_shader(device, include_bytes!("../shaders/basic.frag.spv"))?;
 
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
@@ -177,7 +203,26 @@ fn create_pipeline(
             .name(c"main"),
     ];
 
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let bindings = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(size_of::<Vertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+    let attributes = [
+        vk::VertexInputAttributeDescription::default()
+            .location(0)
+            .binding(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(offset_of!(Vertex, pos) as u32),
+        vk::VertexInputAttributeDescription::default()
+            .location(1)
+            .binding(0)
+            .format(vk::Format::R32G32B32_SFLOAT)
+            .offset(offset_of!(Vertex, color) as u32),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&bindings)
+        .vertex_attribute_descriptions(&attributes);
+
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
@@ -265,6 +310,58 @@ fn build_targets(
     Ok((views, framebuffers))
 }
 
+fn find_memory_type(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+    flags: vk::MemoryPropertyFlags,
+) -> Result<u32> {
+    for i in 0..props.memory_type_count {
+        let allowed = type_bits & (1 << i) != 0;
+        let matches = props.memory_types[i as usize]
+            .property_flags
+            .contains(flags);
+        if allowed && matches {
+            return Ok(i);
+        }
+    }
+    Err("no suitable memory type found".into())
+}
+
+fn create_vertex_storage(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+) -> Result<VertexStorage> {
+    let size = (MAX_VERTICES * size_of::<Vertex>()) as u64;
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+
+    let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let memory_type = find_memory_type(
+        mem_props,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(req.size)
+        .memory_type_index(memory_type);
+    let memory = unsafe { device.allocate_memory(&alloc_info, None)? };
+
+    unsafe { device.bind_buffer_memory(buffer, memory, 0)? };
+    let ptr = unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? }
+        as *mut u8;
+
+    Ok(VertexStorage {
+        buffer,
+        memory,
+        ptr,
+    })
+}
+
 impl GpuContext {
     pub fn new(display: RawDisplayHandle) -> Result<Self> {
         let entry = unsafe { Entry::load()? };
@@ -330,6 +427,7 @@ impl GpuContext {
 
         let props = unsafe { self.instance.get_physical_device_properties(phys) };
         let gpu_name = props.device_name_as_c_str()?.to_string_lossy().into_owned();
+        let mem_props = unsafe { self.instance.get_physical_device_memory_properties(phys) };
 
         let families = unsafe {
             self.instance
@@ -379,6 +477,8 @@ impl GpuContext {
             parts.extent,
         )?;
 
+        let storage = create_vertex_storage(&device, &mem_props)?;
+
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -415,6 +515,10 @@ impl GpuContext {
             image_available,
             render_finished,
             in_flight,
+            vertex_buffer: storage.buffer,
+            vertex_memory: storage.memory,
+            vertex_ptr: storage.ptr,
+            vertex_count: 0,
             images: parts.images,
             format: parts.format,
             extent: parts.extent,
@@ -426,6 +530,25 @@ impl GpuContext {
 }
 
 impl Renderer {
+    pub fn set_vertices(&mut self, vertices: &[Vertex]) -> Result<()> {
+        if vertices.len() > MAX_VERTICES {
+            return Err("too many vertices for the vertex buffer".into());
+        }
+
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.in_flight], true, u64::MAX)?;
+            std::ptr::copy_nonoverlapping(
+                vertices.as_ptr() as *const u8,
+                self.vertex_ptr,
+                size_of_val(vertices),
+            );
+        }
+
+        self.vertex_count = vertices.len() as u32;
+        Ok(())
+    }
+
     pub fn resize(&mut self, surface: &Surface, size: (u32, u32)) -> Result<()> {
         if size.0 == 0 || size.1 == 0 {
             return Ok(());
@@ -539,7 +662,9 @@ impl Renderer {
             };
             self.device.cmd_set_viewport(cb, 0, &[viewport]);
             self.device.cmd_set_scissor(cb, 0, &[scissor]);
-            self.device.cmd_draw(cb, 3, 1, 0, 0);
+            self.device
+                .cmd_bind_vertex_buffers(cb, 0, &[self.vertex_buffer], &[0]);
+            self.device.cmd_draw(cb, self.vertex_count, 1, 0, 0);
 
             self.device.cmd_end_render_pass(cb);
             self.device.end_command_buffer(cb)?;
@@ -576,6 +701,9 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.device.unmap_memory(self.vertex_memory);
+            self.device.destroy_buffer(self.vertex_buffer, None);
+            self.device.free_memory(self.vertex_memory, None);
             self.device.destroy_fence(self.in_flight, None);
             for &s in &self.render_finished {
                 self.device.destroy_semaphore(s, None);

@@ -3,9 +3,31 @@ use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
-use y_gpu::{GpuContext, Renderer, Surface};
+use y_gpu::{GpuContext, Renderer, Surface, Vertex};
 
 const BACKGROUND: [f32; 4] = [0.08, 0.05, 0.18, 1.0];
+
+fn scene() -> Vec<Vertex> {
+    let red = [1.0, 0.0, 0.0];
+    let green = [0.0, 1.0, 0.0];
+    let blue = [0.0, 0.0, 1.0];
+    let yellow = [1.0, 0.9, 0.0];
+    let magenta = [1.0, 0.0, 1.0];
+    let cyan = [0.0, 1.0, 1.0];
+    let white = [1.0, 1.0, 1.0];
+
+    vec![
+        Vertex::new([-0.5, -0.6], red),
+        Vertex::new([-0.05, 0.6], green),
+        Vertex::new([-0.95, 0.6], blue),
+        Vertex::new([0.1, -0.6], yellow),
+        Vertex::new([0.9, -0.6], magenta),
+        Vertex::new([0.9, 0.6], cyan),
+        Vertex::new([0.1, -0.6], yellow),
+        Vertex::new([0.9, 0.6], cyan),
+        Vertex::new([0.1, 0.6], white),
+    ]
+}
 
 struct App {
     renderer: Option<Renderer>,
@@ -53,10 +75,14 @@ impl ApplicationHandler for App {
             .unwrap_or(0);
 
         let size = window.inner_size();
-        let renderer = self
+        let mut renderer = self
             .gpu
             .create_renderer(&surface, (size.width, size.height), gpu_index)
             .expect("failed to create renderer");
+
+        renderer
+            .set_vertices(&scene())
+            .expect("failed to upload vertices");
 
         println!(
             "Y: renderer ready | GPU: {} | format {:?} | {}x{} | {} swapchain images",
