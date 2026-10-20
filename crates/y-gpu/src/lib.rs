@@ -31,6 +31,18 @@ impl Vertex {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureId(usize);
+
+pub const SOLID_TEXTURE: TextureId = TextureId(0);
+
+#[derive(Clone, Copy, Debug)]
+pub struct DrawCall {
+    pub texture: TextureId,
+    pub first_vertex: u32,
+    pub vertex_count: u32,
+}
+
 pub struct GpuInfo {
     pub name: String,
     pub device_type: vk::PhysicalDeviceType,
@@ -67,8 +79,8 @@ pub struct Renderer {
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
     vertex_ptr: *mut u8,
-    vertex_count: u32,
-    texture: Texture,
+    draws: Vec<DrawCall>,
+    textures: Vec<Texture>,
     pub images: Vec<vk::Image>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
@@ -575,8 +587,8 @@ impl GpuContext {
             vertex_buffer: storage.buffer,
             vertex_memory: storage.memory,
             vertex_ptr: storage.ptr,
-            vertex_count: 0,
-            texture,
+            draws: Vec::new(),
+            textures: vec![texture],
             images: parts.images,
             format: parts.format,
             extent: parts.extent,
@@ -588,7 +600,7 @@ impl GpuContext {
 }
 
 impl Renderer {
-    pub fn set_texture(&mut self, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
+    pub fn create_texture(&mut self, width: u32, height: u32, pixels: &[u8]) -> Result<TextureId> {
         let texture = Texture::new(
             &self.device,
             &self.mem_props,
@@ -599,15 +611,19 @@ impl Renderer {
             height,
             pixels,
         )?;
-        unsafe { self.device.device_wait_idle()? };
-        let old = std::mem::replace(&mut self.texture, texture);
-        old.destroy(&self.device);
-        Ok(())
+        self.textures.push(texture);
+        Ok(TextureId(self.textures.len() - 1))
     }
 
-    pub fn set_vertices(&mut self, vertices: &[Vertex]) -> Result<()> {
+    pub fn set_scene(&mut self, vertices: &[Vertex], draws: &[DrawCall]) -> Result<()> {
         if vertices.len() > MAX_VERTICES {
             return Err("too many vertices for the vertex buffer".into());
+        }
+        for draw in draws {
+            let end = (draw.first_vertex + draw.vertex_count) as usize;
+            if draw.texture.0 >= self.textures.len() || end > vertices.len() {
+                return Err("draw call references a missing texture or vertex range".into());
+            }
         }
 
         unsafe {
@@ -620,7 +636,8 @@ impl Renderer {
             );
         }
 
-        self.vertex_count = vertices.len() as u32;
+        self.draws.clear();
+        self.draws.extend_from_slice(draws);
         Ok(())
     }
 
@@ -722,14 +739,6 @@ impl Renderer {
 
             self.device
                 .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-            self.device.cmd_bind_descriptor_sets(
-                cb,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &[self.texture.set],
-                &[],
-            );
 
             let viewport = vk::Viewport {
                 x: 0.0,
@@ -759,7 +768,18 @@ impl Renderer {
 
             self.device
                 .cmd_bind_vertex_buffers(cb, 0, &[self.vertex_buffer], &[0]);
-            self.device.cmd_draw(cb, self.vertex_count, 1, 0, 0);
+            for draw in &self.draws {
+                self.device.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &[self.textures[draw.texture.0].set],
+                    &[],
+                );
+                self.device
+                    .cmd_draw(cb, draw.vertex_count, 1, draw.first_vertex, 0);
+            }
 
             self.device.cmd_end_render_pass(cb);
             self.device.end_command_buffer(cb)?;
@@ -796,7 +816,9 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.texture.destroy(&self.device);
+            for texture in &self.textures {
+                texture.destroy(&self.device);
+            }
             self.device.unmap_memory(self.vertex_memory);
             self.device.destroy_buffer(self.vertex_buffer, None);
             self.device.free_memory(self.vertex_memory, None);

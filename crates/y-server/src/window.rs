@@ -1,9 +1,8 @@
-use y_gpu::Vertex;
+use y_gpu::{DrawCall, SOLID_TEXTURE, TextureId, Vertex};
 
 const TITLE_BAR_HEIGHT: f32 = 28.0;
 const TITLE_BAR_SHADE: f32 = 0.55;
-const TEXTURE_SIZE: f32 = 64.0;
-const SOLID_TEXEL: [f32; 2] = [0.5 / TEXTURE_SIZE, 0.5 / TEXTURE_SIZE];
+const SOLID_TEXEL: [f32; 2] = [0.5 / 64.0, 0.5 / 64.0];
 
 pub struct Window {
     pub id: u32,
@@ -12,6 +11,7 @@ pub struct Window {
     pub width: f32,
     pub height: f32,
     pub color: [f32; 3],
+    pub texture: Option<TextureId>,
 }
 
 #[derive(Default)]
@@ -31,6 +31,7 @@ impl WindowStack {
             width,
             height,
             color,
+            texture: None,
         });
         id
     }
@@ -61,8 +62,23 @@ impl WindowStack {
         }
     }
 
-    pub fn vertices(&self) -> Vec<Vertex> {
-        let mut out = Vec::with_capacity(self.windows.len() * 12);
+    pub fn pending_textures(&self) -> Vec<(u32, u32, u32)> {
+        self.windows
+            .iter()
+            .filter(|w| w.texture.is_none())
+            .map(|w| (w.id, w.width as u32, (w.height - TITLE_BAR_HEIGHT) as u32))
+            .collect()
+    }
+
+    pub fn set_texture(&mut self, id: u32, texture: TextureId) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.texture = Some(texture);
+        }
+    }
+
+    pub fn scene(&self) -> (Vec<Vertex>, Vec<DrawCall>) {
+        let mut vertices = Vec::with_capacity(self.windows.len() * 12);
+        let mut draws = Vec::with_capacity(self.windows.len() * 2);
 
         for w in &self.windows {
             let title_color = [
@@ -70,25 +86,45 @@ impl WindowStack {
                 w.color[1] * TITLE_BAR_SHADE,
                 w.color[2] * TITLE_BAR_SHADE,
             ];
+            let first_vertex = vertices.len() as u32;
             push_rect(
-                &mut out,
+                &mut vertices,
                 [w.x, w.y, w.width, TITLE_BAR_HEIGHT],
                 title_color,
                 SOLID_TEXEL,
                 SOLID_TEXEL,
             );
+            draws.push(DrawCall {
+                texture: SOLID_TEXTURE,
+                first_vertex,
+                vertex_count: 6,
+            });
 
-            let body_height = w.height - TITLE_BAR_HEIGHT;
+            let (texture, color, uv0, uv1) = match w.texture {
+                Some(t) => (t, [1.0, 1.0, 1.0], [0.0, 0.0], [1.0, 1.0]),
+                None => (SOLID_TEXTURE, w.color, SOLID_TEXEL, SOLID_TEXEL),
+            };
+            let first_vertex = vertices.len() as u32;
             push_rect(
-                &mut out,
-                [w.x, w.y + TITLE_BAR_HEIGHT, w.width, body_height],
-                w.color,
-                [0.0, 0.0],
-                [w.width / TEXTURE_SIZE, body_height / TEXTURE_SIZE],
+                &mut vertices,
+                [
+                    w.x,
+                    w.y + TITLE_BAR_HEIGHT,
+                    w.width,
+                    w.height - TITLE_BAR_HEIGHT,
+                ],
+                color,
+                uv0,
+                uv1,
             );
+            draws.push(DrawCall {
+                texture,
+                first_vertex,
+                vertex_count: 6,
+            });
         }
 
-        out
+        (vertices, draws)
     }
 }
 

@@ -19,6 +19,33 @@ fn build_stack() -> WindowStack {
     stack
 }
 
+fn demo_content(width: u32, height: u32, seed: u32) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let fx = x as f32 / width as f32;
+            let fy = y as f32 / height as f32;
+            let (r, g, b) = match seed % 3 {
+                0 => (fx, fy, 1.0 - fx),
+                1 => (1.0 - fy, fx, fy),
+                _ => (fx, 1.0 - fx, fy),
+            };
+            let shade = if x % 40 == 0 || y % 40 == 0 {
+                0.35
+            } else {
+                1.0
+            };
+            pixels.extend_from_slice(&[
+                (r * shade * 255.0) as u8,
+                (g * shade * 255.0) as u8,
+                (b * shade * 255.0) as u8,
+                255,
+            ]);
+        }
+    }
+    pixels
+}
+
 struct App {
     renderer: Option<Renderer>,
     surface: Option<Surface>,
@@ -44,9 +71,10 @@ impl App {
 
     fn upload_scene(&mut self) {
         if let Some(renderer) = &mut self.renderer {
+            let (vertices, draws) = self.stack.scene();
             renderer
-                .set_vertices(&self.stack.vertices())
-                .expect("failed to upload vertices");
+                .set_scene(&vertices, &draws)
+                .expect("failed to upload scene");
         }
     }
 }
@@ -76,10 +104,18 @@ impl ApplicationHandler for App {
             .unwrap_or(0);
 
         let size = window.inner_size();
-        let renderer = self
+        let mut renderer = self
             .gpu
             .create_renderer(&surface, (size.width, size.height), gpu_index)
             .expect("failed to create renderer");
+
+        for (id, width, height) in self.stack.pending_textures() {
+            let pixels = demo_content(width, height, id);
+            let texture = renderer
+                .create_texture(width, height, &pixels)
+                .expect("failed to create window texture");
+            self.stack.set_texture(id, texture);
+        }
 
         println!(
             "Y: renderer ready | GPU: {} | format {:?} | {}x{} | {} swapchain images",
