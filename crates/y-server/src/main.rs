@@ -1,4 +1,7 @@
+mod window;
+
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
+use window::WindowStack;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -8,25 +11,12 @@ use y_gpu::{GpuContext, Renderer, Surface, Vertex};
 const BACKGROUND: [f32; 4] = [0.08, 0.05, 0.18, 1.0];
 
 fn scene() -> Vec<Vertex> {
-    let red = [1.0, 0.0, 0.0];
-    let green = [0.0, 1.0, 0.0];
-    let blue = [0.0, 0.0, 1.0];
-    let yellow = [1.0, 0.9, 0.0];
-    let magenta = [1.0, 0.0, 1.0];
-    let cyan = [0.0, 1.0, 1.0];
-    let white = [1.0, 1.0, 1.0];
-
-    vec![
-        Vertex::new([-0.5, -0.6], red),
-        Vertex::new([-0.05, 0.6], green),
-        Vertex::new([-0.95, 0.6], blue),
-        Vertex::new([0.1, -0.6], yellow),
-        Vertex::new([0.9, -0.6], magenta),
-        Vertex::new([0.9, 0.6], cyan),
-        Vertex::new([0.1, -0.6], yellow),
-        Vertex::new([0.9, 0.6], cyan),
-        Vertex::new([0.1, 0.6], white),
-    ]
+    let mut stack = WindowStack::default();
+    let blue = stack.add(60.0, 60.0, 360.0, 260.0, [0.2, 0.4, 0.9]);
+    stack.add(260.0, 160.0, 320.0, 240.0, [0.2, 0.75, 0.4]);
+    stack.add(440.0, 80.0, 280.0, 220.0, [0.95, 0.6, 0.15]);
+    stack.raise(blue);
+    stack.vertices()
 }
 
 struct App {

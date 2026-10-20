@@ -243,7 +243,11 @@ fn create_pipeline(
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-    let layout_info = vk::PipelineLayoutCreateInfo::default();
+    let push_ranges = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(8)];
+    let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges);
     let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
 
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
@@ -662,6 +666,16 @@ impl Renderer {
             };
             self.device.cmd_set_viewport(cb, 0, &[viewport]);
             self.device.cmd_set_scissor(cb, 0, &[scissor]);
+            let mut resolution = [0u8; 8];
+            resolution[..4].copy_from_slice(&(self.extent.width as f32).to_ne_bytes());
+            resolution[4..].copy_from_slice(&(self.extent.height as f32).to_ne_bytes());
+            self.device.cmd_push_constants(
+                cb,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &resolution,
+            );
             self.device
                 .cmd_bind_vertex_buffers(cb, 0, &[self.vertex_buffer], &[0]);
             self.device.cmd_draw(cb, self.vertex_count, 1, 0, 0);
