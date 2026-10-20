@@ -97,7 +97,7 @@ impl GpuContext {
         let devices = unsafe { self.instance.enumerate_physical_devices()? };
         let phys = *devices
             .get(gpu_index)
-            .ok_or("índice de GPU inválido (use Y_GPU=0, 1 ou 2)")?;
+            .ok_or("invalid GPU index (use Y_GPU=0, 1 or 2)")?;
 
         let props = unsafe { self.instance.get_physical_device_properties(phys) };
         let gpu_name = props.device_name_as_c_str()?.to_string_lossy().into_owned();
@@ -118,7 +118,7 @@ impl GpuContext {
                 break;
             }
         }
-        let queue_family = queue_family.ok_or("nenhuma fila gráfica com suporte a apresentação")?;
+        let queue_family = queue_family.ok_or("no graphics queue with presentation support")?;
 
         let priorities = [1.0f32];
         let queue_infos = [vk::DeviceQueueCreateInfo::default()

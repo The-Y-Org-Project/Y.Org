@@ -22,14 +22,17 @@ impl ApplicationHandler for App {
         }
 
         let window = event_loop
-            .create_window(Window::default_attributes().with_title("Y.Org - teste"))
-            .expect("falha ao criar a janela");
+            .create_window(Window::default_attributes().with_title("Y.Org - test"))
+            .expect("failed to create window");
 
-        let handle = window.window_handle().expect("sem window handle").as_raw();
+        let handle = window
+            .window_handle()
+            .expect("failed to get window handle")
+            .as_raw();
         let surface = self
             .gpu
             .create_surface(self.display, handle)
-            .expect("falha ao criar a superfície Vulkan");
+            .expect("failed to create Vulkan surface");
 
         let gpu_index: usize = std::env::var("Y_GPU")
             .ok()
@@ -40,10 +43,10 @@ impl ApplicationHandler for App {
         let renderer = self
             .gpu
             .create_renderer(&surface, (size.width, size.height), gpu_index)
-            .expect("falha ao criar o renderer");
+            .expect("failed to create renderer");
 
         println!(
-            "Y: renderer pronto | GPU: {} | formato {:?} | {}x{} | {} imagens na swapchain",
+            "Y: renderer ready | GPU: {} | format {:?} | {}x{} | {} swapchain images",
             renderer.gpu_name,
             renderer.format,
             renderer.extent.width,
@@ -61,14 +64,14 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                println!("Y: fechando...");
+                println!("Y: shutting down...");
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
                 if let Some(renderer) = &self.renderer {
                     renderer
                         .draw_clear(BACKGROUND)
-                        .expect("falha ao desenhar o quadro");
+                        .expect("failed to draw frame");
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -87,7 +90,7 @@ fn main() -> y_gpu::Result<()> {
     let gpu = GpuContext::new(display)?;
 
     let gpus = gpu.list_gpus()?;
-    println!("Y: {} GPU(s) encontrada(s)", gpus.len());
+    println!("Y: {} GPU(s) found", gpus.len());
     for (i, g) in gpus.iter().enumerate() {
         let (a, b, c) = g.vulkan_version;
         println!(
