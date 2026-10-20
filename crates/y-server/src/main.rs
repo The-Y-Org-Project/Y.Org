@@ -5,7 +5,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 use y_gpu::{GpuContext, Renderer, Surface};
 
-const BACKGROUND: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+const BACKGROUND: [f32; 4] = [0.08, 0.05, 0.18, 1.0];
 
 struct App {
     renderer: Option<Renderer>,
@@ -86,7 +86,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let stale = match &self.renderer {
                     Some(renderer) => renderer
-                        .draw_clear(BACKGROUND)
+                        .draw_frame(BACKGROUND)
                         .expect("failed to draw frame"),
                     None => false,
                 };
