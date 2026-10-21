@@ -8,3 +8,4 @@ raw-window-handle = "0.6"
 smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend"] }
 winit = "0.30"
 y-gpu = { version = "0.1.0", path = "../y-gpu" }
+xkbcommon = "0.8.0" # <-- ADICIONE ISSO

@@ -2,14 +2,17 @@ mod wayland;
 mod window;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
+use smithay::backend::input::{ButtonState, KeyState};
 use smithay::reexports::wayland_server::backend::ObjectId;
 use std::time::{Duration, Instant};
 use wayland::WaylandServer;
-use window::WindowStack;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::PhysicalKey;
+use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{Window, WindowId};
+use window::WindowStack;
 use y_gpu::{GpuContext, Renderer, Surface};
 
 const BACKGROUND: [f32; 4] = [0.08, 0.05, 0.18, 1.0];
@@ -242,9 +245,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
+                let time = self.started.elapsed().as_millis() as u32;
+                self.wayland.pointer_motion(self.cursor.0, self.cursor.1, time);
+
                 if let Some((id, dx, dy)) = self.drag {
-                    self.stack
-                        .move_to(id, self.cursor.0 - dx, self.cursor.1 - dy);
+                    self.stack.move_to(id, self.cursor.0 - dx, self.cursor.1 - dy);
                     self.upload_scene();
                 }
             }
@@ -252,22 +257,55 @@ impl ApplicationHandler for App {
                 if button != MouseButton::Left {
                     return;
                 }
+                let time = self.started.elapsed().as_millis() as u32;
+                let btn_state = if state == ElementState::Pressed {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                };
+
                 match state {
                     ElementState::Pressed => {
                         if let Some((id, on_title)) =
                             self.stack.hit_test(self.cursor.0, self.cursor.1)
                         {
                             self.stack.raise(id);
+
+                            if let Some((surface_id, _)) =
+                                self.mapped.iter().find(|(_, wid)| *wid == id)
+                            {
+                                self.wayland.set_focus(surface_id.clone(), time);
+                            }
+
                             if on_title {
                                 if let Some((wx, wy)) = self.stack.position(id) {
                                     self.drag = Some((id, self.cursor.0 - wx, self.cursor.1 - wy));
                                 }
+                            } else {
+                                self.wayland.pointer_button(0x110, btn_state, time);
                             }
                             self.upload_scene();
                         }
                     }
                     ElementState::Released => {
-                        self.drag = None;
+                        if self.drag.is_some() {
+                            self.drag = None;
+                        } else {
+                            self.wayland.pointer_button(0x110, btn_state, time);
+                        }
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if let Some(scancode) = code.to_scancode() {
+                        let time = self.started.elapsed().as_millis() as u32;
+                        let key_state = if event.state == ElementState::Pressed {
+                            KeyState::Pressed
+                        } else {
+                            KeyState::Released
+                        };
+                        self.wayland.key_input(scancode, key_state, time);
                     }
                 }
             }

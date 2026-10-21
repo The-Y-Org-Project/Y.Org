@@ -1,7 +1,14 @@
 use smithay::{
-    backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
+    backend::{
+        input::{ButtonState, KeyState},
+        renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
+    },
     delegate_compositor, delegate_seat, delegate_shm, delegate_xdg_shell,
-    input::{Seat, SeatHandler, SeatState},
+    input::{
+        Seat, SeatHandler, SeatState,
+        keyboard::{FilterResult, xkb},
+        pointer::{ButtonEvent, MotionEvent},
+    },
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -15,7 +22,7 @@ use smithay::{
             },
         },
     },
-    utils::Serial,
+    utils::{Logical, Point, Serial},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -42,7 +49,7 @@ struct WaylandState {
     xdg_shell_state: XdgShellState,
     shm_state: ShmState,
     seat_state: SeatState<Self>,
-    _seat: Seat<Self>,
+    pub seat: Seat<Self>,
     updates: Vec<(ObjectId, SurfacePixels)>,
 }
 
@@ -197,14 +204,17 @@ impl WaylandServer {
         let dh = display.handle();
 
         let mut seat_state = SeatState::new();
-        let seat = seat_state.new_wl_seat(&dh, "y-seat");
+        let mut seat = seat_state.new_wl_seat(&dh, "y-seat");
+        
+        seat.add_keyboard(Default::default(), 200, 25).expect("Failed to add keyboard");
+        seat.add_pointer();
 
         let state = WaylandState {
             compositor_state: CompositorState::new::<WaylandState>(&dh),
             xdg_shell_state: XdgShellState::new::<WaylandState>(&dh),
             shm_state: ShmState::new::<WaylandState>(&dh, vec![]),
             seat_state,
-            _seat: seat,
+            seat,
             updates: Vec::new(),
         };
 
@@ -247,6 +257,60 @@ impl WaylandServer {
     pub fn send_frames(&self, time: u32) {
         for surface in self.state.xdg_shell_state.toplevel_surfaces() {
             send_frames_surface_tree(surface.wl_surface(), time);
+        }
+    }
+
+    pub fn set_focus(&mut self, id: ObjectId, time: u32) {
+        let surface = self
+            .state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|surface| surface.wl_surface().id() == id)
+            .map(|surface| surface.wl_surface().clone());
+
+        if let Some(surface) = surface {
+            let serial = Serial::from(time);
+            if let Some(keyboard) = self.state.seat.get_keyboard() {
+                let _ = keyboard.set_focus(&mut self.state, Some(surface), serial);
+            }
+        }
+    }
+
+    pub fn key_input(&mut self, scancode: u32, key_state: KeyState, time: u32) {
+        let serial = Serial::from(time);
+        let keycode = xkb::Keycode::new(scancode + 8);
+
+        if let Some(keyboard) = self.state.seat.get_keyboard() {
+            let _ = keyboard.input(
+                &mut self.state,
+                keycode,
+                key_state,
+                serial,
+                time,
+                |_, _, _| FilterResult::<()>::Forward,
+            );
+        }
+    }
+
+    pub fn pointer_motion(&mut self, x: f32, y: f32, time: u32) {
+        let serial = Serial::from(time);
+        if let Some(pointer) = self.state.seat.get_pointer() {
+            let location = Point::<f64, Logical>::from((x as f64, y as f64));
+            let focus = pointer.current_focus();
+            
+            pointer.motion(
+                &mut self.state,
+                focus.map(|s| (s, Point::<f64, Logical>::from((0.0, 0.0)))),
+                &MotionEvent { location, serial, time },
+            );
+        }
+    }
+
+    pub fn pointer_button(&mut self, button: u32, btn_state: ButtonState, time: u32) {
+        let serial = Serial::from(time);
+        if let Some(pointer) = self.state.seat.get_pointer() {
+            pointer.button(&mut self.state, &ButtonEvent { button, state: btn_state, serial, time });
         }
     }
 }
