@@ -615,6 +615,50 @@ impl Renderer {
         Ok(TextureId(self.textures.len() - 1))
     }
 
+    pub fn update_texture(
+        &mut self,
+        id: TextureId,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<()> {
+        let same_size = self
+            .textures
+            .get(id.0)
+            .map(|t| t.width == width && t.height == height)
+            .ok_or("unknown texture id")?;
+
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.in_flight], true, u64::MAX)?
+        };
+
+        if same_size {
+            return self.textures[id.0].update(
+                &self.device,
+                &self.mem_props,
+                self.queue,
+                self.command_pool,
+                pixels,
+            );
+        }
+
+        let fresh = Texture::new(
+            &self.device,
+            &self.mem_props,
+            self.queue,
+            self.command_pool,
+            self.set_layout,
+            width,
+            height,
+            pixels,
+        )?;
+        unsafe { self.device.device_wait_idle()? };
+        let old = std::mem::replace(&mut self.textures[id.0], fresh);
+        old.destroy(&self.device);
+        Ok(())
+    }
+
     pub fn set_scene(&mut self, vertices: &[Vertex], draws: &[DrawCall]) -> Result<()> {
         if vertices.len() > MAX_VERTICES {
             return Err("too many vertices for the vertex buffer".into());

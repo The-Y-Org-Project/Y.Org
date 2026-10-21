@@ -1,6 +1,10 @@
+mod wayland;
 mod window;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
+use smithay::reexports::wayland_server::backend::ObjectId;
+use std::time::{Duration, Instant};
+use wayland::WaylandServer;
 use window::WindowStack;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -9,6 +13,7 @@ use winit::window::{Window, WindowId};
 use y_gpu::{GpuContext, Renderer, Surface};
 
 const BACKGROUND: [f32; 4] = [0.08, 0.05, 0.18, 1.0];
+const SOCKET_NAME: &str = "wayland-y";
 
 fn build_stack() -> WindowStack {
     let mut stack = WindowStack::default();
@@ -55,6 +60,9 @@ struct App {
     stack: WindowStack,
     cursor: (f32, f32),
     drag: Option<(u32, f32, f32)>,
+    wayland: WaylandServer,
+    mapped: Vec<(ObjectId, u32)>,
+    started: Instant,
 }
 
 impl App {
@@ -75,6 +83,88 @@ impl App {
             renderer
                 .set_scene(&vertices, &draws)
                 .expect("failed to upload scene");
+        }
+    }
+
+    fn pump_wayland(&mut self) {
+        self.wayland
+            .dispatch()
+            .expect("failed to dispatch Wayland clients");
+
+        let alive = self.wayland.toplevel_ids();
+        let mut changed = false;
+
+        let mut gone = Vec::new();
+        self.mapped.retain(|(surface_id, window_id)| {
+            let keep = alive.contains(surface_id);
+            if !keep {
+                gone.push(*window_id);
+            }
+            keep
+        });
+        for window_id in gone {
+            self.stack.remove(window_id);
+            if matches!(self.drag, Some((id, _, _)) if id == window_id) {
+                self.drag = None;
+            }
+            println!("Y: Wayland toplevel closed, window {window_id} removed");
+            changed = true;
+        }
+
+        for surface_id in alive {
+            if self.mapped.iter().any(|(known, _)| *known == surface_id) {
+                continue;
+            }
+            let n = self.mapped.len() as f32;
+            let id = self.stack.add(
+                80.0 + 40.0 * n,
+                80.0 + 30.0 * n,
+                400.0,
+                300.0,
+                [0.45, 0.45, 0.5],
+            );
+            self.stack.raise(id);
+            self.mapped.push((surface_id, id));
+            println!("Y: new Wayland toplevel mapped as window {id}");
+            changed = true;
+        }
+
+        for (surface_id, pixels) in self.wayland.take_updates() {
+            let Some(window_id) = self
+                .mapped
+                .iter()
+                .find(|(known, _)| *known == surface_id)
+                .map(|(_, id)| *id)
+            else {
+                continue;
+            };
+            let Some(renderer) = self.renderer.as_mut() else {
+                continue;
+            };
+
+            match self.stack.texture_of(window_id) {
+                Some(texture) => renderer
+                    .update_texture(texture, pixels.width, pixels.height, &pixels.rgba)
+                    .expect("failed to update window texture"),
+                None => {
+                    let texture = renderer
+                        .create_texture(pixels.width, pixels.height, &pixels.rgba)
+                        .expect("failed to create window texture");
+                    self.stack.set_texture(window_id, texture);
+                    changed = true;
+                }
+            }
+
+            if self
+                .stack
+                .set_body_size(window_id, pixels.width, pixels.height)
+            {
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.upload_scene();
         }
     }
 }
@@ -134,6 +224,13 @@ impl ApplicationHandler for App {
         self.upload_scene();
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.pump_wayland();
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(8),
+        ));
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
@@ -175,6 +272,8 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.wayland
+                    .send_frames(self.started.elapsed().as_millis() as u32);
                 let stale = match &self.renderer {
                     Some(renderer) => renderer
                         .draw_frame(BACKGROUND)
@@ -210,6 +309,9 @@ fn main() -> y_gpu::Result<()> {
         );
     }
 
+    let wayland = WaylandServer::new(SOCKET_NAME)?;
+    println!("Y: Wayland socket ready, use WAYLAND_DISPLAY={SOCKET_NAME}");
+
     let mut app = App {
         renderer: None,
         surface: None,
@@ -219,6 +321,9 @@ fn main() -> y_gpu::Result<()> {
         stack: build_stack(),
         cursor: (0.0, 0.0),
         drag: None,
+        wayland,
+        mapped: Vec::new(),
+        started: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())

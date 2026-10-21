@@ -36,6 +36,10 @@ impl WindowStack {
         id
     }
 
+    pub fn remove(&mut self, id: u32) {
+        self.windows.retain(|w| w.id != id);
+    }
+
     pub fn raise(&mut self, id: u32) {
         if let Some(index) = self.windows.iter().position(|w| w.id == id) {
             let window = self.windows.remove(index);
@@ -68,6 +72,27 @@ impl WindowStack {
             .filter(|w| w.texture.is_none())
             .map(|w| (w.id, w.width as u32, (w.height - TITLE_BAR_HEIGHT) as u32))
             .collect()
+    }
+
+    pub fn texture_of(&self, id: u32) -> Option<TextureId> {
+        self.windows
+            .iter()
+            .find(|w| w.id == id)
+            .and_then(|w| w.texture)
+    }
+
+    pub fn set_body_size(&mut self, id: u32, width: u32, height: u32) -> bool {
+        match self.windows.iter_mut().find(|w| w.id == id) {
+            Some(w) => {
+                let new_width = width as f32;
+                let new_height = height as f32 + TITLE_BAR_HEIGHT;
+                let changed = w.width != new_width || w.height != new_height;
+                w.width = new_width;
+                w.height = new_height;
+                changed
+            }
+            None => false,
+        }
     }
 
     pub fn set_texture(&mut self, id: u32, texture: TextureId) {
