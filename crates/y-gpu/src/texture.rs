@@ -178,7 +178,7 @@ impl Texture {
 
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(vk::Format::B8G8R8A8_UNORM)
             .extent(vk::Extent3D {
                 width,
                 height,
@@ -221,7 +221,7 @@ impl Texture {
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(vk::Format::B8G8R8A8_UNORM)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,

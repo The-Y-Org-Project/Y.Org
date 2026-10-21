@@ -3,12 +3,14 @@ use smithay::{
         input::{ButtonState, KeyState},
         renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
-    delegate_compositor, delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
+    delegate_xdg_shell,
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, xkb},
         pointer::{ButtonEvent, MotionEvent},
     },
+    output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -28,6 +30,11 @@ use smithay::{
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
             TraversalAction, with_surface_tree_downward,
+        },
+        output::OutputHandler,
+        selection::{
+            SelectionHandler,
+            data_device::{ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler},
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -49,6 +56,8 @@ struct WaylandState {
     xdg_shell_state: XdgShellState,
     shm_state: ShmState,
     seat_state: SeatState<Self>,
+    data_device_state: DataDeviceState,
+    _output: Output,
     pub seat: Seat<Self>,
     updates: Vec<(ObjectId, SurfacePixels)>,
 }
@@ -84,16 +93,22 @@ fn read_shm_pixels(buffer: &WlBuffer) -> Option<SurfacePixels> {
         let stride = data.stride as usize;
         let offset = data.offset as usize;
         let row_bytes = width * 4;
+        
         if row_bytes > stride || offset + (height - 1) * stride + row_bytes > len {
             return None;
         }
 
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
         let mut rgba = Vec::with_capacity(width * height * 4);
+        
         for y in 0..height {
             let start = offset + y * stride;
-            for px in bytes[start..start + row_bytes].chunks_exact(4) {
-                rgba.extend_from_slice(&[px[2], px[1], px[0], if has_alpha { px[3] } else { 255 }]);
+            rgba.extend_from_slice(&bytes[start..start + row_bytes]);
+        }
+
+        if !has_alpha {
+            for px in rgba.chunks_exact_mut(4) {
+                px[3] = 255;
             }
         }
 
@@ -161,6 +176,22 @@ impl SeatHandler for WaylandState {
     }
 }
 
+impl OutputHandler for WaylandState {}
+
+impl SelectionHandler for WaylandState {
+    type SelectionUserData = ();
+}
+
+impl ClientDndGrabHandler for WaylandState {}
+
+impl ServerDndGrabHandler for WaylandState {}
+
+impl DataDeviceHandler for WaylandState {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+
 impl XdgShellHandler for WaylandState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
@@ -190,6 +221,8 @@ delegate_compositor!(WaylandState);
 delegate_shm!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_xdg_shell!(WaylandState);
+delegate_output!(WaylandState);
+delegate_data_device!(WaylandState);
 
 pub struct WaylandServer {
     display: Display<WaylandState>,
@@ -205,15 +238,37 @@ impl WaylandServer {
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&dh, "y-seat");
-        
-        seat.add_keyboard(Default::default(), 200, 25).expect("Failed to add keyboard");
+
+        seat.add_keyboard(Default::default(), 200, 25)
+            .expect("Failed to add keyboard");
         seat.add_pointer();
+
+        let data_device_state = DataDeviceState::new::<WaylandState>(&dh);
+
+        let output = Output::new(
+            "y-output".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Y.Org".into(),
+                model: "Virtual".into(),
+            },
+        );
+        let _global = output.create_global::<WaylandState>(&dh);
+        let mode = Mode {
+            size: (800, 600).into(),
+            refresh: 60000,
+        };
+        output.change_current_state(Some(mode), None, None, None);
+        output.set_preferred(mode);
 
         let state = WaylandState {
             compositor_state: CompositorState::new::<WaylandState>(&dh),
             xdg_shell_state: XdgShellState::new::<WaylandState>(&dh),
             shm_state: ShmState::new::<WaylandState>(&dh, vec![]),
             seat_state,
+            data_device_state,
+            _output: output,
             seat,
             updates: Vec::new(),
         };
@@ -293,15 +348,28 @@ impl WaylandServer {
         }
     }
 
-    pub fn pointer_motion(&mut self, x: f32, y: f32, time: u32) {
+    pub fn pointer_motion(
+        &mut self,
+        surface_id: Option<ObjectId>,
+        local_pos: (f64, f64),
+        global_pos: (f64, f64),
+        time: u32,
+    ) {
         let serial = Serial::from(time);
         if let Some(pointer) = self.state.seat.get_pointer() {
-            let location = Point::<f64, Logical>::from((x as f64, y as f64));
-            let focus = pointer.current_focus();
-            
+            let location = Point::<f64, Logical>::from(global_pos);
+            let focus = surface_id.and_then(|id| {
+                self.state
+                    .xdg_shell_state
+                    .toplevel_surfaces()
+                    .iter()
+                    .find(|s| s.wl_surface().id() == id)
+                    .map(|s| (s.wl_surface().clone(), Point::<f64, Logical>::from(local_pos)))
+            });
+
             pointer.motion(
                 &mut self.state,
-                focus.map(|s| (s, Point::<f64, Logical>::from((0.0, 0.0)))),
+                focus,
                 &MotionEvent { location, serial, time },
             );
         }

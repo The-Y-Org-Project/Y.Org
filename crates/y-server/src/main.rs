@@ -89,6 +89,30 @@ impl App {
         }
     }
 
+    fn update_pointer(&mut self, time: u32) {
+        let mut surface_id = None;
+        let mut local = (0.0, 0.0);
+
+        if let Some((window_id, _)) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
+            if let Some((id, _)) = self.mapped.iter().find(|(_, wid)| *wid == window_id) {
+                surface_id = Some(id.clone());
+                if let Some((wx, wy)) = self.stack.position(window_id) {
+                    local = (
+                        (self.cursor.0 - wx) as f64,
+                        (self.cursor.1 - wy) as f64,
+                    );
+                }
+            }
+        }
+
+        self.wayland.pointer_motion(
+            surface_id,
+            local,
+            (self.cursor.0 as f64, self.cursor.1 as f64),
+            time,
+        );
+    }
+
     fn pump_wayland(&mut self) {
         self.wayland
             .dispatch()
@@ -246,7 +270,8 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
                 let time = self.started.elapsed().as_millis() as u32;
-                self.wayland.pointer_motion(self.cursor.0, self.cursor.1, time);
+
+                self.update_pointer(time);
 
                 if let Some((id, dx, dy)) = self.drag {
                     self.stack.move_to(id, self.cursor.0 - dx, self.cursor.1 - dy);
@@ -282,6 +307,7 @@ impl ApplicationHandler for App {
                                     self.drag = Some((id, self.cursor.0 - wx, self.cursor.1 - wy));
                                 }
                             } else {
+                                self.update_pointer(time);
                                 self.wayland.pointer_button(0x110, btn_state, time);
                             }
                             self.upload_scene();
@@ -291,6 +317,7 @@ impl ApplicationHandler for App {
                         if self.drag.is_some() {
                             self.drag = None;
                         } else {
+                            self.update_pointer(time);
                             self.wayland.pointer_button(0x110, btn_state, time);
                         }
                     }
