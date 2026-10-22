@@ -4,6 +4,7 @@ Testing, please dont try to use.
 
 ## Screenshots
 
+<img width="1366" height="768" alt="Captura de tela de 2026-10-22 17-20-03" src="https://github.com/user-attachments/assets/2cdb23f9-4b95-4a6a-b212-59249a9a574d" />
 <img width="1366" height="768" alt="Captura de tela de 2026-10-20 21-28-05" src="https://github.com/user-attachments/assets/1f4131bd-a7a0-47af-9fbb-9163f6f58bc0" />
 <img width="1366" height="768" alt="Captura de tela de 2026-10-20 23-20-28" src="https://github.com/user-attachments/assets/664ef123-8f27-49d7-ba4d-7bbcfb7f589e" />
 <img width="1366" height="768" alt="Captura de tela de 2026-10-20 23-17-27" src="https://github.com/user-attachments/assets/7d910945-da95-4077-8768-6544671109af" />
