@@ -19,6 +19,9 @@ use y_gpu::{GpuContext, Renderer, Surface};
 const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const SOCKET_NAME: &str = "wayland-y";
 const RESIZE_MARGIN: f32 = 8.0;
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 struct App {
     renderer: Option<Renderer>,
@@ -33,6 +36,7 @@ struct App {
     modifiers: ModifiersState,
     wayland: WaylandServer,
     mapped: Vec<(ObjectId, u32)>,
+    popup_windows: Vec<(ObjectId, u32)>,
     started: Instant,
 }
 
@@ -57,11 +61,31 @@ impl App {
         }
     }
 
+    fn window_for_surface(&self, surface_id: &ObjectId) -> Option<u32> {
+        self.mapped
+            .iter()
+            .chain(self.popup_windows.iter())
+            .find(|(known, _)| known == surface_id)
+            .map(|(_, id)| *id)
+    }
+
+    fn surface_for_window(&self, window_id: u32) -> Option<ObjectId> {
+        self.mapped
+            .iter()
+            .chain(self.popup_windows.iter())
+            .find(|(_, id)| *id == window_id)
+            .map(|(surface_id, _)| surface_id.clone())
+    }
+
+    fn is_popup_window(&self, window_id: u32) -> bool {
+        self.popup_windows.iter().any(|(_, id)| *id == window_id)
+    }
+
     fn current_surface(&self) -> (Option<ObjectId>, (f64, f64)) {
         if let Some(window_id) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
-            if let Some((id, _)) = self.mapped.iter().find(|(_, wid)| *wid == window_id) {
+            if let Some(surface_id) = self.surface_for_window(window_id) {
                 if let Some((wx, wy)) = self.stack.position(window_id) {
-                    return (Some(id.clone()), (wx as f64, wy as f64));
+                    return (Some(surface_id), (wx as f64, wy as f64));
                 }
             }
         }
@@ -69,10 +93,10 @@ impl App {
     }
 
     fn update_pointer(&mut self) {
-        let (surface_id, local) = self.current_surface();
+        let (surface_id, origin) = self.current_surface();
         self.wayland.pointer_motion(
             surface_id,
-            local,
+            origin,
             (self.cursor.0 as f64, self.cursor.1 as f64),
         );
     }
@@ -123,13 +147,56 @@ impl App {
             changed = true;
         }
 
-        for (surface_id, pixels) in self.wayland.take_updates() {
-            let Some(window_id) = self
-                .mapped
+        let popups = self.wayland.popup_infos();
+
+        let mut popup_gone = Vec::new();
+        self.popup_windows.retain(|(surface_id, window_id)| {
+            let keep = popups.iter().any(|p| p.id == *surface_id);
+            if !keep {
+                popup_gone.push(*window_id);
+            }
+            keep
+        });
+        for window_id in popup_gone {
+            self.stack.remove(window_id);
+            changed = true;
+        }
+
+        for info in &popups {
+            let Some(parent_window) = self.window_for_surface(&info.parent) else {
+                continue;
+            };
+            let Some((parent_x, parent_y)) = self.stack.position(parent_window) else {
+                continue;
+            };
+            let x = parent_x + info.offset.0 as f32;
+            let y = parent_y + info.offset.1 as f32;
+
+            let existing = self
+                .popup_windows
                 .iter()
-                .find(|(known, _)| *known == surface_id)
-                .map(|(_, id)| *id)
-            else {
+                .find(|(known, _)| *known == info.id)
+                .map(|(_, id)| *id);
+
+            match existing {
+                Some(window_id) => {
+                    if self.stack.position(window_id) != Some((x, y)) {
+                        self.stack.move_to(window_id, x, y);
+                        changed = true;
+                    }
+                }
+                None => {
+                    let window_id = self.stack.add(x, y, 0.0, 0.0, [0.0, 0.0, 0.0]);
+                    self.stack.raise(window_id);
+                    self.popup_windows.push((info.id.clone(), window_id));
+                    println!("Y.Org: new Wayland popup mapped as window {window_id}");
+                    changed = true;
+                }
+            }
+        }
+
+        for (surface_id, pixels) in self.wayland.take_updates() {
+            let Some(window_id) = self.window_for_surface(&surface_id) else {
                 continue;
             };
             let Some(renderer) = self.renderer.as_mut() else {
@@ -159,8 +226,6 @@ impl App {
 
         if changed {
             self.upload_scene();
-            // Atualiza o ponteiro para garantir que o foco seja reavaliado
-            // se uma nova janela apareceu sob o cursor.
             self.update_pointer();
         }
     }
@@ -170,6 +235,10 @@ impl App {
             if x < w.x || x > w.x + w.width || y < w.y || y > w.y + w.height {
                 continue;
             }
+            if self.is_popup_window(w.id) {
+                return None;
+            }
+
             let left = (x - w.x).abs() < RESIZE_MARGIN;
             let right = (w.x + w.width - x).abs() < RESIZE_MARGIN;
             let top = (y - w.y).abs() < RESIZE_MARGIN;
@@ -295,11 +364,8 @@ impl ApplicationHandler for App {
                     let new_h = (start_h + (self.cursor.1 - start_y)).max(100.0);
                     self.stack.set_body_size(id, new_w as u32, new_h as u32);
                     if let Some((surface_id, _)) = self.mapped.iter().find(|(_, wid)| *wid == id) {
-                        self.wayland.resize_toplevel(
-                            surface_id.clone(),
-                            new_w as i32,
-                            new_h as i32,
-                        );
+                        self.wayland
+                            .resize_toplevel(surface_id.clone(), new_w as i32, new_h as i32);
                     }
                     self.upload_scene();
                 } else {
@@ -307,9 +373,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if button != MouseButton::Left {
-                    return;
-                }
+                let code = match button {
+                    MouseButton::Left => BTN_LEFT,
+                    MouseButton::Right => BTN_RIGHT,
+                    MouseButton::Middle => BTN_MIDDLE,
+                    _ => return,
+                };
+                let is_left = button == MouseButton::Left;
                 let btn_state = if state == ElementState::Pressed {
                     ButtonState::Pressed
                 } else {
@@ -317,44 +387,53 @@ impl ApplicationHandler for App {
                 };
 
                 if state == ElementState::Pressed {
-                    if let Some((id, _edges)) = self.edge_hit(self.cursor.0, self.cursor.1) {
+                    let hit = self.stack.hit_test(self.cursor.0, self.cursor.1);
+                    let on_popup = hit.is_some_and(|id| self.is_popup_window(id));
+
+                    if !on_popup && self.wayland.has_popups() {
+                        self.wayland.dismiss_popups();
+                    }
+
+                    let edge = if is_left && !on_popup {
+                        self.edge_hit(self.cursor.0, self.cursor.1)
+                    } else {
+                        None
+                    };
+
+                    if let Some((id, _edges)) = edge {
                         if let Some(w) = self.stack.windows.iter().find(|w| w.id == id) {
                             self.resize =
                                 Some((id, self.cursor.0, self.cursor.1, w.width, w.height));
                         }
-                    } else if self.modifiers.shift_key() {
-                        if let Some(id) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
+                    } else if is_left && !on_popup && self.modifiers.shift_key() {
+                        if let Some(id) = hit {
                             self.stack.raise(id);
                             if let Some((wx, wy)) = self.stack.position(id) {
                                 self.drag = Some((id, self.cursor.0 - wx, self.cursor.1 - wy));
                             }
-                            if let Some((surface_id, _)) =
-                                self.mapped.iter().find(|(_, wid)| *wid == id)
-                            {
-                                self.wayland.set_focus(surface_id.clone());
+                            if let Some(surface_id) = self.surface_for_window(id) {
+                                self.wayland.set_focus(surface_id);
                             }
                             self.upload_scene();
                         }
-                    } else if let Some(id) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
-                        self.stack.raise(id);
-
-                        if let Some((surface_id, _)) =
-                            self.mapped.iter().find(|(_, wid)| *wid == id)
-                        {
-                            self.wayland.set_focus(surface_id.clone());
+                    } else if let Some(id) = hit {
+                        if !on_popup {
+                            self.stack.raise(id);
+                            if let Some(surface_id) = self.surface_for_window(id) {
+                                self.wayland.set_focus(surface_id);
+                            }
                         }
-
-                        // Atualiza o ponteiro (motion) para garantir que o foco
-                        // esteja correto antes de enviar o botão.
                         self.update_pointer();
-                        self.wayland.pointer_button(0x110, btn_state);
+                        self.wayland.pointer_button(code, btn_state);
                         self.upload_scene();
                     }
                 } else {
-                    self.drag = None;
-                    self.resize = None;
+                    if is_left {
+                        self.drag = None;
+                        self.resize = None;
+                    }
                     self.update_pointer();
-                    self.wayland.pointer_button(0x110, btn_state);
+                    self.wayland.pointer_button(code, btn_state);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -428,6 +507,7 @@ fn main() -> y_gpu::Result<()> {
         modifiers: ModifiersState::empty(),
         wayland,
         mapped: Vec::new(),
+        popup_windows: Vec::new(),
         started: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
