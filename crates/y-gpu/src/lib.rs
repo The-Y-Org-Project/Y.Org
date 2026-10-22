@@ -295,7 +295,13 @@ fn create_pipeline(
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
     let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(vk::ColorComponentFlags::RGBA)
-        .blend_enable(false)];
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD)];
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];

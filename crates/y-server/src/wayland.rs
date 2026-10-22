@@ -4,7 +4,7 @@ use smithay::{
         renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
-    delegate_xdg_shell,
+    delegate_xdg_decoration, delegate_xdg_shell,
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, xkb},
@@ -12,7 +12,10 @@ use smithay::{
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_protocols::xdg::{
+            decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+            shell::server::xdg_toplevel,
+        },
         wayland_server::{
             Client, Display, ListeningSocket, Resource,
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
@@ -41,6 +44,7 @@ use smithay::{
         shell::xdg::{
             PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
             XdgShellState,
+            decoration::{XdgDecorationHandler, XdgDecorationState},
         },
         shm::{BufferData, ShmHandler, ShmState, with_buffer_contents},
     },
@@ -73,6 +77,7 @@ pub struct PopupInfo {
 struct WaylandState {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
+    xdg_decoration_state: XdgDecorationState,
     shm_state: ShmState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
@@ -224,6 +229,24 @@ impl DataDeviceHandler for WaylandState {
     }
 }
 
+impl XdgDecorationHandler for WaylandState {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(mode);
+        });
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, _toplevel: ToplevelSurface) {}
+}
+
 impl XdgShellHandler for WaylandState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
@@ -259,6 +282,7 @@ delegate_compositor!(WaylandState);
 delegate_shm!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_xdg_shell!(WaylandState);
+delegate_xdg_decoration!(WaylandState);
 delegate_output!(WaylandState);
 delegate_data_device!(WaylandState);
 
@@ -304,6 +328,7 @@ impl WaylandServer {
         let state = WaylandState {
             compositor_state: CompositorState::new::<WaylandState>(&dh),
             xdg_shell_state: XdgShellState::new::<WaylandState>(&dh),
+            xdg_decoration_state: XdgDecorationState::new::<WaylandState>(&dh),
             shm_state: ShmState::new::<WaylandState>(&dh, vec![]),
             seat_state,
             data_device_state,
@@ -346,6 +371,21 @@ impl WaylandServer {
             .collect()
     }
 
+    pub fn has_csd(&self, id: ObjectId) -> bool {
+        let mode = self
+            .state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|s| s.wl_surface().id() == id)
+            .and_then(|s| s.with_pending_state(|state| state.decoration_mode));
+
+        match mode {
+            Some(DecorationMode::ServerSide) => false,
+            _ => true,
+        }
+    }
+
     pub fn popup_infos(&mut self) -> Vec<PopupInfo> {
         self.state.popups.retain(|p| p.wl_surface().is_alive());
         self.state
@@ -369,10 +409,7 @@ impl WaylandServer {
     }
 
     pub fn has_popups(&self) -> bool {
-        self.state
-            .popups
-            .iter()
-            .any(|p| p.wl_surface().is_alive())
+        self.state.popups.iter().any(|p| p.wl_surface().is_alive())
     }
 
     pub fn dismiss_popups(&mut self) {
@@ -411,6 +448,24 @@ impl WaylandServer {
             if let Some(keyboard) = self.state.seat.get_keyboard() {
                 let _ = keyboard.set_focus(&mut self.state, Some(surface), next_serial());
             }
+        }
+    }
+
+    pub fn clear_focus(&mut self) {
+        if let Some(keyboard) = self.state.seat.get_keyboard() {
+            let _ = keyboard.set_focus(&mut self.state, None, next_serial());
+        }
+    }
+
+    pub fn close_toplevel(&mut self, id: ObjectId) {
+        if let Some(surface) = self
+            .state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|s| s.wl_surface().id() == id)
+        {
+            surface.send_close();
         }
     }
 

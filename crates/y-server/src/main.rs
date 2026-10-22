@@ -7,21 +7,31 @@ use smithay::reexports::wayland_server::backend::ObjectId;
 use std::env;
 use std::time::{Duration, Instant};
 use wayland::WaylandServer;
-use window::WindowStack;
+use window::{Decorations, Restore, WindowStack};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{ModifiersState, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{CursorIcon, Window, WindowId};
 use y_gpu::{GpuContext, Renderer, Surface};
 
-const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+const BACKGROUND: [f32; 4] = [0.08, 0.05, 0.18, 1.0];
 const SOCKET_NAME: &str = "wayland-y";
-const RESIZE_MARGIN: f32 = 8.0;
+const RESIZE_MARGIN: f32 = 6.0;
+const MIN_OUTER_W: f32 = 120.0;
+const MIN_OUTER_H: f32 = 100.0;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
+
+#[derive(Clone, Copy)]
+struct ResizeState {
+    window_id: u32,
+    start_cursor: (f32, f32),
+    start_outer: (f32, f32, f32, f32),
+    edges: u8,
+}
 
 struct App {
     renderer: Option<Renderer>,
@@ -32,15 +42,26 @@ struct App {
     stack: WindowStack,
     cursor: (f32, f32),
     drag: Option<(u32, f32, f32)>,
-    resize: Option<(u32, f32, f32, f32, f32)>,
+    resize: Option<ResizeState>,
     modifiers: ModifiersState,
     wayland: WaylandServer,
     mapped: Vec<(ObjectId, u32)>,
     popup_windows: Vec<(ObjectId, u32)>,
+    focused: Option<u32>,
     started: Instant,
 }
 
 impl App {
+    fn screen_size(&self) -> (f32, f32) {
+        self.window
+            .as_ref()
+            .map(|w| {
+                let s = w.inner_size();
+                (s.width as f32, s.height as f32)
+            })
+            .unwrap_or((800.0, 600.0))
+    }
+
     fn resize_to_window(&mut self) {
         if let (Some(renderer), Some(surface), Some(window)) =
             (&mut self.renderer, &self.surface, &self.window)
@@ -53,8 +74,9 @@ impl App {
     }
 
     fn upload_scene(&mut self) {
+        let screen = self.screen_size();
         if let Some(renderer) = &mut self.renderer {
-            let (vertices, draws) = self.stack.scene();
+            let (vertices, draws) = self.stack.scene(screen);
             renderer
                 .set_scene(&vertices, &draws)
                 .expect("failed to upload scene");
@@ -81,8 +103,26 @@ impl App {
         self.popup_windows.iter().any(|(_, id)| *id == window_id)
     }
 
+    fn set_focus(&mut self, id: Option<u32>) {
+        self.focused = id;
+        self.stack.set_focused(id);
+    }
+
+    fn outer_of(&self, id: u32) -> Option<(f32, f32, f32, f32)> {
+        let w = self.stack.window(id)?;
+        let (oy, oh) = if w.decorations == Decorations::Server {
+            (w.y - window::TITLE_BAR_HEIGHT, w.height + window::TITLE_BAR_HEIGHT)
+        } else {
+            (w.y, w.height)
+        };
+        Some((w.x, oy, w.width, oh))
+    }
+
     fn current_surface(&self) -> (Option<ObjectId>, (f64, f64)) {
-        if let Some(window_id) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
+        if let Some((window_id, on_bar)) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
+            if on_bar {
+                return (None, (0.0, 0.0));
+            }
             if let Some(surface_id) = self.surface_for_window(window_id) {
                 if let Some((wx, wy)) = self.stack.position(window_id) {
                     return (Some(surface_id), (wx as f64, wy as f64));
@@ -99,6 +139,83 @@ impl App {
             origin,
             (self.cursor.0 as f64, self.cursor.1 as f64),
         );
+    }
+
+    fn minimize_window(&mut self, id: u32) {
+        if let Some(w) = self.stack.window_mut(id) {
+            if w.minimized {
+                return;
+            }
+            w.minimized = true;
+        }
+        if self.focused == Some(id) {
+            self.set_focus(None);
+            self.wayland.clear_focus();
+        }
+        self.upload_scene();
+    }
+
+    fn restore_window(&mut self, id: u32) {
+        if let Some(w) = self.stack.window_mut(id) {
+            w.minimized = false;
+        }
+        self.stack.raise(id);
+        if let Some(surface_id) = self.surface_for_window(id) {
+            self.wayland.set_focus(surface_id);
+        }
+        self.set_focus(Some(id));
+        self.upload_scene();
+    }
+
+    fn toggle_maximize(&mut self, id: u32) {
+        let screen = self.screen_size();
+
+        let (maximized, restore) = match self.stack.window(id) {
+            Some(w) => (w.maximized, w.restore),
+            None => return,
+        };
+
+        if maximized {
+            if let Some(r) = restore {
+                if let Some(w) = self.stack.window_mut(id) {
+                    w.x = r.x;
+                    w.y = r.y;
+                    w.width = r.width as f32;
+                    w.height = r.height as f32;
+                    w.maximized = false;
+                    w.restore = None;
+                }
+                if let Some(surface_id) = self.surface_for_window(id) {
+                    self.wayland.resize_toplevel(surface_id, r.width, r.height);
+                }
+            }
+        } else {
+            let (cx, cy, cw, ch) = match self.stack.window(id) {
+                Some(w) => (w.x, w.y, w.width as i32, w.height as i32),
+                None => return,
+            };
+            if let Some(w) = self.stack.window_mut(id) {
+                w.restore = Some(Restore {
+                    x: cx,
+                    y: cy,
+                    width: cw,
+                    height: ch,
+                });
+                w.x = 0.0;
+                w.y = window::TITLE_BAR_HEIGHT;
+                w.width = screen.0;
+                w.height = screen.1 - window::TITLE_BAR_HEIGHT;
+                w.maximized = true;
+            }
+            if let Some(surface_id) = self.surface_for_window(id) {
+                self.wayland.resize_toplevel(
+                    surface_id,
+                    screen.0 as i32,
+                    (screen.1 - window::TITLE_BAR_HEIGHT) as i32,
+                );
+            }
+        }
+        self.upload_scene();
     }
 
     fn pump_wayland(&mut self) {
@@ -122,8 +239,11 @@ impl App {
             if matches!(self.drag, Some((id, _, _)) if id == window_id) {
                 self.drag = None;
             }
-            if matches!(self.resize, Some((id, _, _, _, _)) if id == window_id) {
+            if matches!(self.resize, Some(rs) if rs.window_id == window_id) {
                 self.resize = None;
+            }
+            if self.focused == Some(window_id) {
+                self.set_focus(None);
             }
             println!("Y.Org: Wayland toplevel closed, window {window_id} removed");
             changed = true;
@@ -136,15 +256,23 @@ impl App {
             let n = self.mapped.len() as f32;
             let id = self.stack.add(
                 80.0 + 40.0 * n,
-                80.0 + 30.0 * n,
+                80.0 + 30.0 * n + window::TITLE_BAR_HEIGHT,
                 400.0,
                 300.0,
                 [0.45, 0.45, 0.5],
             );
             self.stack.raise(id);
             self.mapped.push((surface_id, id));
+            if self.focused.is_none() {
+                self.set_focus(Some(id));
+            }
             println!("Y.Org: new Wayland toplevel mapped as window {id}");
             changed = true;
+        }
+
+        for (surface_id, window_id) in &self.mapped {
+            let csd = self.wayland.has_csd(surface_id.clone());
+            self.stack.set_csd(*window_id, csd);
         }
 
         let popups = self.wayland.popup_infos();
@@ -187,6 +315,7 @@ impl App {
                 }
                 None => {
                     let window_id = self.stack.add(x, y, 0.0, 0.0, [0.0, 0.0, 0.0]);
+                    self.stack.set_csd(window_id, true);
                     self.stack.raise(window_id);
                     self.popup_windows.push((info.id.clone(), window_id));
                     println!("Y.Org: new Wayland popup mapped as window {window_id}");
@@ -232,37 +361,26 @@ impl App {
 
     fn edge_hit(&self, x: f32, y: f32) -> Option<(u32, u8)> {
         for w in self.stack.windows.iter().rev() {
-            if x < w.x || x > w.x + w.width || y < w.y || y > w.y + w.height {
+            if w.minimized || self.is_popup_window(w.id) {
                 continue;
             }
-            if self.is_popup_window(w.id) {
-                return None;
+            let Some((ox, oy, ow, oh)) = self.outer_of(w.id) else {
+                continue;
+            };
+            if x < ox || x > ox + ow || y < oy || y > oy + oh {
+                continue;
             }
-
-            let left = (x - w.x).abs() < RESIZE_MARGIN;
-            let right = (w.x + w.width - x).abs() < RESIZE_MARGIN;
-            let top = (y - w.y).abs() < RESIZE_MARGIN;
-            let bottom = (w.y + w.height - y).abs() < RESIZE_MARGIN;
+            let left = (x - ox).abs() < RESIZE_MARGIN;
+            let right = (ox + ow - x).abs() < RESIZE_MARGIN;
+            let top_edge = (y - oy).abs() < RESIZE_MARGIN;
+            let bottom = (oy + oh - y).abs() < RESIZE_MARGIN;
 
             let mut edges = 0u8;
-            if left {
-                edges |= 1;
-            }
-            if right {
-                edges |= 2;
-            }
-            if top {
-                edges |= 4;
-            }
-            if bottom {
-                edges |= 8;
-            }
-
-            return if edges != 0 {
-                Some((w.id, edges))
-            } else {
-                None
-            };
+            if left { edges |= 1; }
+            if right { edges |= 2; }
+            if top_edge { edges |= 4; }
+            if bottom { edges |= 8; }
+            return if edges != 0 { Some((w.id, edges)) } else { None };
         }
         None
     }
@@ -273,11 +391,9 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-
         let window = event_loop
             .create_window(Window::default_attributes().with_title("Y.Org"))
             .expect("failed to create window");
-
         let handle = window
             .window_handle()
             .expect("failed to get window handle")
@@ -286,18 +402,15 @@ impl ApplicationHandler for App {
             .gpu
             .create_surface(self.display, handle)
             .expect("failed to create Vulkan surface");
-
         let gpu_index: usize = std::env::var("Y_GPU")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-
         let size = window.inner_size();
         let renderer = self
             .gpu
             .create_renderer(&surface, (size.width, size.height), gpu_index)
             .expect("failed to create renderer");
-
         println!(
             "Y.Org: renderer ready | GPU: {} | format {:?} | {}x{} | {} swapchain images",
             renderer.gpu_name,
@@ -306,9 +419,7 @@ impl ApplicationHandler for App {
             renderer.extent.height,
             renderer.images.len(),
         );
-
         window.request_redraw();
-
         self.renderer = Some(renderer);
         self.surface = Some(surface);
         self.window = Some(window);
@@ -328,12 +439,8 @@ impl ApplicationHandler for App {
                 println!("Y.Org: shutting down...");
                 event_loop.exit();
             }
-            WindowEvent::Resized(_) => {
-                self.resize_to_window();
-            }
-            WindowEvent::ModifiersChanged(mods) => {
-                self.modifiers = mods.state();
-            }
+            WindowEvent::Resized(_) => self.resize_to_window(),
+            WindowEvent::ModifiersChanged(mods) => self.modifiers = mods.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
 
@@ -342,10 +449,8 @@ impl ApplicationHandler for App {
                         let icon = match edges {
                             1 | 2 => CursorIcon::EwResize,
                             4 | 8 => CursorIcon::NsResize,
-                            3 => CursorIcon::EwResize,
-                            5 | 10 => CursorIcon::NwseResize,
-                            6 | 9 => CursorIcon::NeswResize,
-                            12 => CursorIcon::NsResize,
+                            3 | 6 | 9 | 12 => CursorIcon::NwseResize,
+                            5 | 10 => CursorIcon::NeswResize,
                             _ => CursorIcon::Default,
                         };
                         window.set_cursor(icon);
@@ -355,17 +460,67 @@ impl ApplicationHandler for App {
                 }
 
                 if let Some((id, dx, dy)) = self.drag {
-                    self.stack
-                        .move_to(id, self.cursor.0 - dx, self.cursor.1 - dy);
+                    let nx = self.cursor.0 - dx;
+                    let ny_outer = self.cursor.1 - dy;
+                    let ny = if let Some(w) = self.stack.window(id) {
+                        if w.decorations == Decorations::Server {
+                            ny_outer + window::TITLE_BAR_HEIGHT
+                        } else {
+                            ny_outer
+                        }
+                    } else {
+                        ny_outer
+                    };
+                    self.stack.move_to(id, nx, ny);
                     self.update_pointer();
                     self.upload_scene();
-                } else if let Some((id, start_x, start_y, start_w, start_h)) = self.resize {
-                    let new_w = (start_w + (self.cursor.0 - start_x)).max(100.0);
-                    let new_h = (start_h + (self.cursor.1 - start_y)).max(100.0);
-                    self.stack.set_body_size(id, new_w as u32, new_h as u32);
-                    if let Some((surface_id, _)) = self.mapped.iter().find(|(_, wid)| *wid == id) {
+                } else if let Some(rs) = self.resize {
+                    let dx = self.cursor.0 - rs.start_cursor.0;
+                    let dy = self.cursor.1 - rs.start_cursor.1;
+
+                    let (mut ox, mut oy, mut ow, mut oh) = rs.start_outer;
+
+                    if rs.edges & 1 != 0 {
+                        ox += dx;
+                        ow -= dx;
+                    }
+                    if rs.edges & 2 != 0 {
+                        ow += dx;
+                    }
+                    if rs.edges & 4 != 0 {
+                        oy += dy;
+                        oh -= dy;
+                    }
+                    if rs.edges & 8 != 0 {
+                        oh += dy;
+                    }
+
+                    if ow < MIN_OUTER_W {
+                        if rs.edges & 1 != 0 {
+                            ox = rs.start_outer.0 + rs.start_outer.2 - MIN_OUTER_W;
+                        }
+                        ow = MIN_OUTER_W;
+                    }
+                    if oh < MIN_OUTER_H {
+                        if rs.edges & 4 != 0 {
+                            oy = rs.start_outer.1 + rs.start_outer.3 - MIN_OUTER_H;
+                        }
+                        oh = MIN_OUTER_H;
+                    }
+
+                    let (cy, ch) = match self.stack.window(rs.window_id) {
+                        Some(w) if w.decorations == Decorations::Server => {
+                            (oy + window::TITLE_BAR_HEIGHT, oh - window::TITLE_BAR_HEIGHT)
+                        }
+                        _ => (oy, oh),
+                    };
+
+                    self.stack.set_geometry(rs.window_id, ox, cy, ow, ch);
+                    if let Some((surface_id, _)) =
+                        self.mapped.iter().find(|(_, wid)| *wid == rs.window_id)
+                    {
                         self.wayland
-                            .resize_toplevel(surface_id.clone(), new_w as i32, new_h as i32);
+                            .resize_toplevel(surface_id.clone(), ow as i32, ch as i32);
                     }
                     self.upload_scene();
                 } else {
@@ -387,41 +542,83 @@ impl ApplicationHandler for App {
                 };
 
                 if state == ElementState::Pressed {
+                    if is_left {
+                        if let Some(id) =
+                            self.stack.hit_close_button(self.cursor.0, self.cursor.1)
+                        {
+                            if let Some(surface_id) = self.surface_for_window(id) {
+                                self.wayland.close_toplevel(surface_id);
+                            }
+                            return;
+                        }
+                    }
+
+                    let screen = self.screen_size();
+                    if let Some(docked_id) =
+                        self.stack.dock_hit(self.cursor.0, self.cursor.1, screen)
+                    {
+                        self.restore_window(docked_id);
+                        return;
+                    }
+
+                    if is_left {
+                        if let Some((id, edges)) = self.edge_hit(self.cursor.0, self.cursor.1) {
+                            if let Some(outer) = self.outer_of(id) {
+                                self.resize = Some(ResizeState {
+                                    window_id: id,
+                                    start_cursor: (self.cursor.0, self.cursor.1),
+                                    start_outer: outer,
+                                    edges,
+                                });
+                                return;
+                            }
+                        }
+                    }
+
                     let hit = self.stack.hit_test(self.cursor.0, self.cursor.1);
-                    let on_popup = hit.is_some_and(|id| self.is_popup_window(id));
+
+                    if is_left {
+                        if let Some((id, true)) = hit {
+                            self.stack.raise(id);
+                            if let Some(surface_id) = self.surface_for_window(id) {
+                                self.wayland.set_focus(surface_id);
+                            }
+                            self.set_focus(Some(id));
+                            if let Some((ox, oy, _, _)) = self.outer_of(id) {
+                                self.drag =
+                                    Some((id, self.cursor.0 - ox, self.cursor.1 - oy));
+                            }
+                            self.upload_scene();
+                            return;
+                        }
+                    }
+
+                    let on_popup = hit.is_some_and(|(id, _)| self.is_popup_window(id));
 
                     if !on_popup && self.wayland.has_popups() {
                         self.wayland.dismiss_popups();
                     }
 
-                    let edge = if is_left && !on_popup {
-                        self.edge_hit(self.cursor.0, self.cursor.1)
-                    } else {
-                        None
-                    };
-
-                    if let Some((id, _edges)) = edge {
-                        if let Some(w) = self.stack.windows.iter().find(|w| w.id == id) {
-                            self.resize =
-                                Some((id, self.cursor.0, self.cursor.1, w.width, w.height));
-                        }
-                    } else if is_left && !on_popup && self.modifiers.shift_key() {
-                        if let Some(id) = hit {
+                    if is_left && !on_popup && self.modifiers.shift_key() {
+                        if let Some((id, _)) = hit {
                             self.stack.raise(id);
-                            if let Some((wx, wy)) = self.stack.position(id) {
-                                self.drag = Some((id, self.cursor.0 - wx, self.cursor.1 - wy));
+                            if let Some((ox, oy, _, _)) = self.outer_of(id) {
+                                self.drag =
+                                    Some((id, self.cursor.0 - ox, self.cursor.1 - oy));
                             }
                             if let Some(surface_id) = self.surface_for_window(id) {
                                 self.wayland.set_focus(surface_id);
                             }
+                            self.set_focus(Some(id));
                             self.upload_scene();
                         }
-                    } else if let Some(id) = hit {
+                    } else if let Some((id, _)) = hit {
                         if !on_popup {
                             self.stack.raise(id);
                             if let Some(surface_id) = self.surface_for_window(id) {
                                 self.wayland.set_focus(surface_id);
                             }
+                            self.set_focus(Some(id));
                         }
                         self.update_pointer();
                         self.wayland.pointer_button(code, btn_state);
@@ -444,6 +641,48 @@ impl ApplicationHandler for App {
                         } else {
                             KeyState::Released
                         };
+
+                        if key_state == KeyState::Pressed && self.modifiers.super_key() {
+                            match code {
+                                KeyCode::KeyM => {
+                                    if let Some(id) = self.focused {
+                                        self.minimize_window(id);
+                                    }
+                                    return;
+                                }
+                                KeyCode::ArrowUp => {
+                                    if let Some(id) = self.focused {
+                                        self.toggle_maximize(id);
+                                    }
+                                    return;
+                                }
+                                KeyCode::ArrowDown => {
+                                    if let Some(id) = self.focused {
+                                        let maximized = self
+                                            .stack
+                                            .window(id)
+                                            .map(|w| w.maximized)
+                                            .unwrap_or(false);
+                                        if maximized {
+                                            self.toggle_maximize(id);
+                                        } else {
+                                            self.minimize_window(id);
+                                        }
+                                    }
+                                    return;
+                                }
+                                KeyCode::KeyQ => {
+                                    if let Some(id) = self.focused {
+                                        if let Some(surface_id) = self.surface_for_window(id) {
+                                            self.wayland.close_toplevel(surface_id);
+                                        }
+                                    }
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+
                         self.wayland.key_input(scancode, key_state);
                     }
                 }
@@ -508,6 +747,7 @@ fn main() -> y_gpu::Result<()> {
         wayland,
         mapped: Vec::new(),
         popup_windows: Vec::new(),
+        focused: None,
         started: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
