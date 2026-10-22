@@ -1,7 +1,5 @@
 use y_gpu::{DrawCall, SOLID_TEXTURE, TextureId, Vertex};
 
-const TITLE_BAR_HEIGHT: f32 = 28.0;
-const TITLE_BAR_SHADE: f32 = 0.55;
 const SOLID_TEXEL: [f32; 2] = [0.5 / 64.0, 0.5 / 64.0];
 
 pub struct Window {
@@ -16,7 +14,7 @@ pub struct Window {
 
 #[derive(Default)]
 pub struct WindowStack {
-    windows: Vec<Window>,
+    pub windows: Vec<Window>,
     next_id: u32,
 }
 
@@ -47,12 +45,12 @@ impl WindowStack {
         }
     }
 
-    pub fn hit_test(&self, px: f32, py: f32) -> Option<(u32, bool)> {
+    pub fn hit_test(&self, px: f32, py: f32) -> Option<u32> {
         self.windows
             .iter()
             .rev()
             .find(|w| px >= w.x && px < w.x + w.width && py >= w.y && py < w.y + w.height)
-            .map(|w| (w.id, py < w.y + TITLE_BAR_HEIGHT))
+            .map(|w| w.id)
     }
 
     pub fn position(&self, id: u32) -> Option<(f32, f32)> {
@@ -66,14 +64,6 @@ impl WindowStack {
         }
     }
 
-    pub fn pending_textures(&self) -> Vec<(u32, u32, u32)> {
-        self.windows
-            .iter()
-            .filter(|w| w.texture.is_none())
-            .map(|w| (w.id, w.width as u32, (w.height - TITLE_BAR_HEIGHT) as u32))
-            .collect()
-    }
-
     pub fn texture_of(&self, id: u32) -> Option<TextureId> {
         self.windows
             .iter()
@@ -85,7 +75,7 @@ impl WindowStack {
         match self.windows.iter_mut().find(|w| w.id == id) {
             Some(w) => {
                 let new_width = width as f32;
-                let new_height = height as f32 + TITLE_BAR_HEIGHT;
+                let new_height = height as f32;
                 let changed = w.width != new_width || w.height != new_height;
                 w.width = new_width;
                 w.height = new_height;
@@ -102,29 +92,10 @@ impl WindowStack {
     }
 
     pub fn scene(&self) -> (Vec<Vertex>, Vec<DrawCall>) {
-        let mut vertices = Vec::with_capacity(self.windows.len() * 12);
-        let mut draws = Vec::with_capacity(self.windows.len() * 2);
+        let mut vertices = Vec::with_capacity(self.windows.len() * 6);
+        let mut draws = Vec::with_capacity(self.windows.len());
 
         for w in &self.windows {
-            let title_color = [
-                w.color[0] * TITLE_BAR_SHADE,
-                w.color[1] * TITLE_BAR_SHADE,
-                w.color[2] * TITLE_BAR_SHADE,
-            ];
-            let first_vertex = vertices.len() as u32;
-            push_rect(
-                &mut vertices,
-                [w.x, w.y, w.width, TITLE_BAR_HEIGHT],
-                title_color,
-                SOLID_TEXEL,
-                SOLID_TEXEL,
-            );
-            draws.push(DrawCall {
-                texture: SOLID_TEXTURE,
-                first_vertex,
-                vertex_count: 6,
-            });
-
             let (texture, color, uv0, uv1) = match w.texture {
                 Some(t) => (t, [1.0, 1.0, 1.0], [0.0, 0.0], [1.0, 1.0]),
                 None => (SOLID_TEXTURE, w.color, SOLID_TEXEL, SOLID_TEXEL),
@@ -132,12 +103,7 @@ impl WindowStack {
             let first_vertex = vertices.len() as u32;
             push_rect(
                 &mut vertices,
-                [
-                    w.x,
-                    w.y + TITLE_BAR_HEIGHT,
-                    w.width,
-                    w.height - TITLE_BAR_HEIGHT,
-                ],
+                [w.x, w.y, w.width, w.height],
                 color,
                 uv0,
                 uv1,

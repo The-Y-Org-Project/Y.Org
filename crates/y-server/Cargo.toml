@@ -3,6 +3,10 @@ name = "y-server"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "yorg"
+path = "src/main.rs"
+
 [dependencies]
 raw-window-handle = "0.6"
 smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend"] }

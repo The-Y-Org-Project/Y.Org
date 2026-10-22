@@ -34,7 +34,9 @@ use smithay::{
         output::OutputHandler,
         selection::{
             SelectionHandler,
-            data_device::{ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler},
+            data_device::{
+                ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+            },
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -43,7 +45,17 @@ use smithay::{
     },
 };
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
+use std::time::Instant;
+
+static SERIAL: AtomicU32 = AtomicU32::new(1);
+
+fn next_serial() -> Serial {
+    Serial::from(SERIAL.fetch_add(1, Ordering::SeqCst))
+}
 
 pub struct SurfacePixels {
     pub width: u32,
@@ -69,11 +81,11 @@ struct ClientState {
 
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {
-        println!("Y: Wayland client connected");
+        println!("Y.Org: Wayland client connected");
     }
 
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
-        println!("Y: Wayland client disconnected");
+        println!("Y.Org: Wayland client disconnected");
     }
 }
 
@@ -93,14 +105,14 @@ fn read_shm_pixels(buffer: &WlBuffer) -> Option<SurfacePixels> {
         let stride = data.stride as usize;
         let offset = data.offset as usize;
         let row_bytes = width * 4;
-        
+
         if row_bytes > stride || offset + (height - 1) * stride + row_bytes > len {
             return None;
         }
 
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
         let mut rgba = Vec::with_capacity(width * height * 4);
-        
+
         for y in 0..height {
             let start = offset + y * stride;
             rgba.extend_from_slice(&bytes[start..start + row_bytes]);
@@ -229,6 +241,7 @@ pub struct WaylandServer {
     state: WaylandState,
     listener: ListeningSocket,
     _clients: Vec<Client>,
+    started: Instant,
 }
 
 impl WaylandServer {
@@ -246,12 +259,12 @@ impl WaylandServer {
         let data_device_state = DataDeviceState::new::<WaylandState>(&dh);
 
         let output = Output::new(
-            "y-output".into(),
+            "Y.Org Display".into(),
             PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
                 make: "Y.Org".into(),
-                model: "Virtual".into(),
+                model: "Y.Compositor".into(),
             },
         );
         let _global = output.create_global::<WaylandState>(&dh);
@@ -280,6 +293,7 @@ impl WaylandServer {
             state,
             listener,
             _clients: Vec::new(),
+            started: Instant::now(),
         })
     }
 
@@ -315,7 +329,7 @@ impl WaylandServer {
         }
     }
 
-    pub fn set_focus(&mut self, id: ObjectId, time: u32) {
+    pub fn set_focus(&mut self, id: ObjectId) {
         let surface = self
             .state
             .xdg_shell_state
@@ -325,15 +339,14 @@ impl WaylandServer {
             .map(|surface| surface.wl_surface().clone());
 
         if let Some(surface) = surface {
-            let serial = Serial::from(time);
             if let Some(keyboard) = self.state.seat.get_keyboard() {
-                let _ = keyboard.set_focus(&mut self.state, Some(surface), serial);
+                let _ = keyboard.set_focus(&mut self.state, Some(surface), next_serial());
             }
         }
     }
 
-    pub fn key_input(&mut self, scancode: u32, key_state: KeyState, time: u32) {
-        let serial = Serial::from(time);
+    pub fn key_input(&mut self, scancode: u32, key_state: KeyState) {
+        let serial = next_serial();
         let keycode = xkb::Keycode::new(scancode + 8);
 
         if let Some(keyboard) = self.state.seat.get_keyboard() {
@@ -342,7 +355,7 @@ impl WaylandServer {
                 keycode,
                 key_state,
                 serial,
-                time,
+                self.started.elapsed().as_millis() as u32,
                 |_, _, _| FilterResult::<()>::Forward,
             );
         }
@@ -351,11 +364,10 @@ impl WaylandServer {
     pub fn pointer_motion(
         &mut self,
         surface_id: Option<ObjectId>,
-        local_pos: (f64, f64),
+        surface_origin: (f64, f64),
         global_pos: (f64, f64),
-        time: u32,
     ) {
-        let serial = Serial::from(time);
+        let serial = next_serial();
         if let Some(pointer) = self.state.seat.get_pointer() {
             let location = Point::<f64, Logical>::from(global_pos);
             let focus = surface_id.and_then(|id| {
@@ -364,21 +376,55 @@ impl WaylandServer {
                     .toplevel_surfaces()
                     .iter()
                     .find(|s| s.wl_surface().id() == id)
-                    .map(|s| (s.wl_surface().clone(), Point::<f64, Logical>::from(local_pos)))
+                    .map(|s| {
+                        (
+                            s.wl_surface().clone(),
+                            Point::<f64, Logical>::from(surface_origin),
+                        )
+                    })
             });
 
             pointer.motion(
                 &mut self.state,
                 focus,
-                &MotionEvent { location, serial, time },
+                &MotionEvent {
+                    location,
+                    serial,
+                    time: self.started.elapsed().as_millis() as u32,
+                },
             );
+            pointer.frame(&mut self.state);
         }
     }
 
-    pub fn pointer_button(&mut self, button: u32, btn_state: ButtonState, time: u32) {
-        let serial = Serial::from(time);
+    pub fn pointer_button(&mut self, button: u32, btn_state: ButtonState) {
+        let serial = next_serial();
         if let Some(pointer) = self.state.seat.get_pointer() {
-            pointer.button(&mut self.state, &ButtonEvent { button, state: btn_state, serial, time });
+            pointer.button(
+                &mut self.state,
+                &ButtonEvent {
+                    button,
+                    state: btn_state,
+                    serial,
+                    time: self.started.elapsed().as_millis() as u32,
+                },
+            );
+            pointer.frame(&mut self.state);
+        }
+    }
+
+    pub fn resize_toplevel(&mut self, id: ObjectId, width: i32, height: i32) {
+        if let Some(surface) = self
+            .state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|s| s.wl_surface().id() == id)
+        {
+            surface.with_pending_state(|state| {
+                state.size = Some((width, height).into());
+            });
+            surface.send_configure();
         }
     }
 }

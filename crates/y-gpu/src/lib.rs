@@ -142,6 +142,17 @@ fn build_swapchain(
         })
         .unwrap_or(formats[0]);
 
+    let present_modes = unsafe {
+        surface
+            .loader
+            .get_physical_device_surface_present_modes(phys, surface.raw)?
+    };
+    let present_mode = if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+        vk::PresentModeKHR::MAILBOX
+    } else {
+        vk::PresentModeKHR::FIFO
+    };
+
     let extent = if caps.current_extent.width != u32::MAX {
         caps.current_extent
     } else {
@@ -171,7 +182,7 @@ fn build_swapchain(
         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
         .pre_transform(caps.current_transform)
         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-        .present_mode(vk::PresentModeKHR::FIFO)
+        .present_mode(present_mode)
         .clipped(true)
         .old_swapchain(old);
 
@@ -421,9 +432,9 @@ impl GpuContext {
         let entry = unsafe { Entry::load()? };
 
         let app_info = vk::ApplicationInfo::default()
-            .application_name(c"Y Window System")
+            .application_name(c"Y.Org")
             .application_version(vk::make_api_version(0, 0, 1, 0))
-            .engine_name(c"Y")
+            .engine_name(c"Y.Org")
             .api_version(vk::API_VERSION_1_1);
 
         let extensions = ash_window::enumerate_required_extensions(display)?;

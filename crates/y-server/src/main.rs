@@ -4,55 +4,21 @@ mod window;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use smithay::backend::input::{ButtonState, KeyState};
 use smithay::reexports::wayland_server::backend::ObjectId;
+use std::env;
 use std::time::{Duration, Instant};
 use wayland::WaylandServer;
+use window::WindowStack;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
-use winit::window::{Window, WindowId};
-use window::WindowStack;
+use winit::window::{CursorIcon, Window, WindowId};
 use y_gpu::{GpuContext, Renderer, Surface};
 
-const BACKGROUND: [f32; 4] = [0.08, 0.05, 0.18, 1.0];
+const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const SOCKET_NAME: &str = "wayland-y";
-
-fn build_stack() -> WindowStack {
-    let mut stack = WindowStack::default();
-    let blue = stack.add(60.0, 60.0, 360.0, 260.0, [0.2, 0.4, 0.9]);
-    stack.add(260.0, 160.0, 320.0, 240.0, [0.2, 0.75, 0.4]);
-    stack.add(440.0, 80.0, 280.0, 220.0, [0.95, 0.6, 0.15]);
-    stack.raise(blue);
-    stack
-}
-
-fn demo_content(width: u32, height: u32, seed: u32) -> Vec<u8> {
-    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
-        for x in 0..width {
-            let fx = x as f32 / width as f32;
-            let fy = y as f32 / height as f32;
-            let (r, g, b) = match seed % 3 {
-                0 => (fx, fy, 1.0 - fx),
-                1 => (1.0 - fy, fx, fy),
-                _ => (fx, 1.0 - fx, fy),
-            };
-            let shade = if x % 40 == 0 || y % 40 == 0 {
-                0.35
-            } else {
-                1.0
-            };
-            pixels.extend_from_slice(&[
-                (r * shade * 255.0) as u8,
-                (g * shade * 255.0) as u8,
-                (b * shade * 255.0) as u8,
-                255,
-            ]);
-        }
-    }
-    pixels
-}
+const RESIZE_MARGIN: f32 = 8.0;
 
 struct App {
     renderer: Option<Renderer>,
@@ -63,6 +29,8 @@ struct App {
     stack: WindowStack,
     cursor: (f32, f32),
     drag: Option<(u32, f32, f32)>,
+    resize: Option<(u32, f32, f32, f32, f32)>,
+    modifiers: ModifiersState,
     wayland: WaylandServer,
     mapped: Vec<(ObjectId, u32)>,
     started: Instant,
@@ -89,27 +57,23 @@ impl App {
         }
     }
 
-    fn update_pointer(&mut self, time: u32) {
-        let mut surface_id = None;
-        let mut local = (0.0, 0.0);
-
-        if let Some((window_id, _)) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
+    fn current_surface(&self) -> (Option<ObjectId>, (f64, f64)) {
+        if let Some(window_id) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
             if let Some((id, _)) = self.mapped.iter().find(|(_, wid)| *wid == window_id) {
-                surface_id = Some(id.clone());
                 if let Some((wx, wy)) = self.stack.position(window_id) {
-                    local = (
-                        (self.cursor.0 - wx) as f64,
-                        (self.cursor.1 - wy) as f64,
-                    );
+                    return (Some(id.clone()), (wx as f64, wy as f64));
                 }
             }
         }
+        (None, (0.0, 0.0))
+    }
 
+    fn update_pointer(&mut self) {
+        let (surface_id, local) = self.current_surface();
         self.wayland.pointer_motion(
             surface_id,
             local,
             (self.cursor.0 as f64, self.cursor.1 as f64),
-            time,
         );
     }
 
@@ -134,7 +98,10 @@ impl App {
             if matches!(self.drag, Some((id, _, _)) if id == window_id) {
                 self.drag = None;
             }
-            println!("Y: Wayland toplevel closed, window {window_id} removed");
+            if matches!(self.resize, Some((id, _, _, _, _)) if id == window_id) {
+                self.resize = None;
+            }
+            println!("Y.Org: Wayland toplevel closed, window {window_id} removed");
             changed = true;
         }
 
@@ -152,7 +119,7 @@ impl App {
             );
             self.stack.raise(id);
             self.mapped.push((surface_id, id));
-            println!("Y: new Wayland toplevel mapped as window {id}");
+            println!("Y.Org: new Wayland toplevel mapped as window {id}");
             changed = true;
         }
 
@@ -192,7 +159,43 @@ impl App {
 
         if changed {
             self.upload_scene();
+            // Atualiza o ponteiro para garantir que o foco seja reavaliado
+            // se uma nova janela apareceu sob o cursor.
+            self.update_pointer();
         }
+    }
+
+    fn edge_hit(&self, x: f32, y: f32) -> Option<(u32, u8)> {
+        for w in self.stack.windows.iter().rev() {
+            if x < w.x || x > w.x + w.width || y < w.y || y > w.y + w.height {
+                continue;
+            }
+            let left = (x - w.x).abs() < RESIZE_MARGIN;
+            let right = (w.x + w.width - x).abs() < RESIZE_MARGIN;
+            let top = (y - w.y).abs() < RESIZE_MARGIN;
+            let bottom = (w.y + w.height - y).abs() < RESIZE_MARGIN;
+
+            let mut edges = 0u8;
+            if left {
+                edges |= 1;
+            }
+            if right {
+                edges |= 2;
+            }
+            if top {
+                edges |= 4;
+            }
+            if bottom {
+                edges |= 8;
+            }
+
+            return if edges != 0 {
+                Some((w.id, edges))
+            } else {
+                None
+            };
+        }
+        None
     }
 }
 
@@ -203,7 +206,7 @@ impl ApplicationHandler for App {
         }
 
         let window = event_loop
-            .create_window(Window::default_attributes().with_title("Y.Org - test"))
+            .create_window(Window::default_attributes().with_title("Y.Org"))
             .expect("failed to create window");
 
         let handle = window
@@ -221,21 +224,13 @@ impl ApplicationHandler for App {
             .unwrap_or(0);
 
         let size = window.inner_size();
-        let mut renderer = self
+        let renderer = self
             .gpu
             .create_renderer(&surface, (size.width, size.height), gpu_index)
             .expect("failed to create renderer");
 
-        for (id, width, height) in self.stack.pending_textures() {
-            let pixels = demo_content(width, height, id);
-            let texture = renderer
-                .create_texture(width, height, &pixels)
-                .expect("failed to create window texture");
-            self.stack.set_texture(id, texture);
-        }
-
         println!(
-            "Y: renderer ready | GPU: {} | format {:?} | {}x{} | {} swapchain images",
+            "Y.Org: renderer ready | GPU: {} | format {:?} | {}x{} | {} swapchain images",
             renderer.gpu_name,
             renderer.format,
             renderer.extent.width,
@@ -261,78 +256,116 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                println!("Y: shutting down...");
+                println!("Y.Org: shutting down...");
                 event_loop.exit();
             }
             WindowEvent::Resized(_) => {
                 self.resize_to_window();
             }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
-                let time = self.started.elapsed().as_millis() as u32;
 
-                self.update_pointer(time);
+                if let Some((_id, edges)) = self.edge_hit(self.cursor.0, self.cursor.1) {
+                    if let Some(window) = &self.window {
+                        let icon = match edges {
+                            1 | 2 => CursorIcon::EwResize,
+                            4 | 8 => CursorIcon::NsResize,
+                            3 => CursorIcon::EwResize,
+                            5 | 10 => CursorIcon::NwseResize,
+                            6 | 9 => CursorIcon::NeswResize,
+                            12 => CursorIcon::NsResize,
+                            _ => CursorIcon::Default,
+                        };
+                        window.set_cursor(icon);
+                    }
+                } else if let Some(window) = &self.window {
+                    window.set_cursor(CursorIcon::Default);
+                }
 
                 if let Some((id, dx, dy)) = self.drag {
-                    self.stack.move_to(id, self.cursor.0 - dx, self.cursor.1 - dy);
+                    self.stack
+                        .move_to(id, self.cursor.0 - dx, self.cursor.1 - dy);
+                    self.update_pointer();
                     self.upload_scene();
+                } else if let Some((id, start_x, start_y, start_w, start_h)) = self.resize {
+                    let new_w = (start_w + (self.cursor.0 - start_x)).max(100.0);
+                    let new_h = (start_h + (self.cursor.1 - start_y)).max(100.0);
+                    self.stack.set_body_size(id, new_w as u32, new_h as u32);
+                    if let Some((surface_id, _)) = self.mapped.iter().find(|(_, wid)| *wid == id) {
+                        self.wayland.resize_toplevel(
+                            surface_id.clone(),
+                            new_w as i32,
+                            new_h as i32,
+                        );
+                    }
+                    self.upload_scene();
+                } else {
+                    self.update_pointer();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button != MouseButton::Left {
                     return;
                 }
-                let time = self.started.elapsed().as_millis() as u32;
                 let btn_state = if state == ElementState::Pressed {
                     ButtonState::Pressed
                 } else {
                     ButtonState::Released
                 };
 
-                match state {
-                    ElementState::Pressed => {
-                        if let Some((id, on_title)) =
-                            self.stack.hit_test(self.cursor.0, self.cursor.1)
-                        {
+                if state == ElementState::Pressed {
+                    if let Some((id, _edges)) = self.edge_hit(self.cursor.0, self.cursor.1) {
+                        if let Some(w) = self.stack.windows.iter().find(|w| w.id == id) {
+                            self.resize =
+                                Some((id, self.cursor.0, self.cursor.1, w.width, w.height));
+                        }
+                    } else if self.modifiers.shift_key() {
+                        if let Some(id) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
                             self.stack.raise(id);
-
+                            if let Some((wx, wy)) = self.stack.position(id) {
+                                self.drag = Some((id, self.cursor.0 - wx, self.cursor.1 - wy));
+                            }
                             if let Some((surface_id, _)) =
                                 self.mapped.iter().find(|(_, wid)| *wid == id)
                             {
-                                self.wayland.set_focus(surface_id.clone(), time);
-                            }
-
-                            if on_title {
-                                if let Some((wx, wy)) = self.stack.position(id) {
-                                    self.drag = Some((id, self.cursor.0 - wx, self.cursor.1 - wy));
-                                }
-                            } else {
-                                self.update_pointer(time);
-                                self.wayland.pointer_button(0x110, btn_state, time);
+                                self.wayland.set_focus(surface_id.clone());
                             }
                             self.upload_scene();
                         }
-                    }
-                    ElementState::Released => {
-                        if self.drag.is_some() {
-                            self.drag = None;
-                        } else {
-                            self.update_pointer(time);
-                            self.wayland.pointer_button(0x110, btn_state, time);
+                    } else if let Some(id) = self.stack.hit_test(self.cursor.0, self.cursor.1) {
+                        self.stack.raise(id);
+
+                        if let Some((surface_id, _)) =
+                            self.mapped.iter().find(|(_, wid)| *wid == id)
+                        {
+                            self.wayland.set_focus(surface_id.clone());
                         }
+
+                        // Atualiza o ponteiro (motion) para garantir que o foco
+                        // esteja correto antes de enviar o botão.
+                        self.update_pointer();
+                        self.wayland.pointer_button(0x110, btn_state);
+                        self.upload_scene();
                     }
+                } else {
+                    self.drag = None;
+                    self.resize = None;
+                    self.update_pointer();
+                    self.wayland.pointer_button(0x110, btn_state);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if let Some(scancode) = code.to_scancode() {
-                        let time = self.started.elapsed().as_millis() as u32;
                         let key_state = if event.state == ElementState::Pressed {
                             KeyState::Pressed
                         } else {
                             KeyState::Released
                         };
-                        self.wayland.key_input(scancode, key_state, time);
+                        self.wayland.key_input(scancode, key_state);
                     }
                 }
             }
@@ -358,6 +391,11 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> y_gpu::Result<()> {
+    unsafe {
+        env::set_var("XDG_CURRENT_DESKTOP", "Y.Org");
+        env::set_var("XDG_SESSION_TYPE", "wayland");
+    }
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
@@ -365,7 +403,7 @@ fn main() -> y_gpu::Result<()> {
     let gpu = GpuContext::new(display)?;
 
     let gpus = gpu.list_gpus()?;
-    println!("Y: {} GPU(s) found", gpus.len());
+    println!("Y.Org: {} GPU(s) found", gpus.len());
     for (i, g) in gpus.iter().enumerate() {
         let (a, b, c) = g.vulkan_version;
         println!(
@@ -375,7 +413,7 @@ fn main() -> y_gpu::Result<()> {
     }
 
     let wayland = WaylandServer::new(SOCKET_NAME)?;
-    println!("Y: Wayland socket ready, use WAYLAND_DISPLAY={SOCKET_NAME}");
+    println!("Y.Org: Wayland socket ready, use WAYLAND_DISPLAY={SOCKET_NAME}");
 
     let mut app = App {
         renderer: None,
@@ -383,9 +421,11 @@ fn main() -> y_gpu::Result<()> {
         window: None,
         gpu,
         display,
-        stack: build_stack(),
+        stack: WindowStack::default(),
         cursor: (0.0, 0.0),
         drag: None,
+        resize: None,
+        modifiers: ModifiersState::empty(),
         wayland,
         mapped: Vec::new(),
         started: Instant::now(),
