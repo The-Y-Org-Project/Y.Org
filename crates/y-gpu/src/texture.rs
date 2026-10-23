@@ -12,6 +12,13 @@ pub struct Texture {
     pub height: u32,
 }
 
+pub struct PendingUpload {
+    pub fence: vk::Fence,
+    pub staging: vk::Buffer,
+    pub staging_memory: vk::DeviceMemory,
+    pub command_buffer: vk::CommandBuffer,
+}
+
 pub fn create_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     let bindings = [vk::DescriptorSetLayoutBinding::default()
         .binding(0)
@@ -29,12 +36,35 @@ fn check_pixels(width: u32, height: u32, pixels: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub fn reap_pending(
+    device: &ash::Device,
+    command_pool: vk::CommandPool,
+    pending: &mut Vec<PendingUpload>,
+) {
+    let mut i = 0;
+    while i < pending.len() {
+        let signaled = unsafe { device.get_fence_status(pending[i].fence).unwrap_or(false) };
+        if signaled {
+            let p = pending.swap_remove(i);
+            unsafe {
+                device.destroy_fence(p.fence, None);
+                device.destroy_buffer(p.staging, None);
+                device.free_memory(p.staging_memory, None);
+                device.free_command_buffers(command_pool, &[p.command_buffer]);
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upload_pixels(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
+    pending: &mut Vec<PendingUpload>,
     image: vk::Image,
     width: u32,
     height: u32,
@@ -43,6 +73,8 @@ fn upload_pixels(
     src_access: vk::AccessFlags,
     src_stage: vk::PipelineStageFlags,
 ) -> Result<()> {
+    reap_pending(device, command_pool, pending);
+
     let staging_info = vk::BufferCreateInfo::default()
         .size(pixels.len() as u64)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -149,14 +181,17 @@ fn upload_pixels(
 
         device.end_command_buffer(cb)?;
 
+        let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
         let cbs = [cb];
         let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-        device.queue_submit(queue, &[submit], vk::Fence::null())?;
-        device.queue_wait_idle(queue)?;
+        device.queue_submit(queue, &[submit], fence)?;
 
-        device.free_command_buffers(command_pool, &cbs);
-        device.destroy_buffer(staging, None);
-        device.free_memory(staging_memory, None);
+        pending.push(PendingUpload {
+            fence,
+            staging,
+            staging_memory,
+            command_buffer: cb,
+        });
     }
 
     Ok(())
@@ -169,6 +204,7 @@ impl Texture {
         mem_props: &vk::PhysicalDeviceMemoryProperties,
         queue: vk::Queue,
         command_pool: vk::CommandPool,
+        pending: &mut Vec<PendingUpload>,
         set_layout: vk::DescriptorSetLayout,
         width: u32,
         height: u32,
@@ -209,6 +245,7 @@ impl Texture {
             mem_props,
             queue,
             command_pool,
+            pending,
             image,
             width,
             height,
@@ -277,12 +314,14 @@ impl Texture {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &self,
         device: &ash::Device,
         mem_props: &vk::PhysicalDeviceMemoryProperties,
         queue: vk::Queue,
         command_pool: vk::CommandPool,
+        pending: &mut Vec<PendingUpload>,
         pixels: &[u8],
     ) -> Result<()> {
         check_pixels(self.width, self.height, pixels)?;
@@ -291,6 +330,7 @@ impl Texture {
             mem_props,
             queue,
             command_pool,
+            pending,
             self.image,
             self.width,
             self.height,

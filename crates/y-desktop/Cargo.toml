@@ -1,0 +1,7 @@
+[package]
+name = "y-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+y-gpu = { version = "0.1.0", path = "../y-gpu" }

@@ -1,0 +1,16 @@
+[package]
+name = "y-terminal"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "yorg-terminal"
+path = "src/main.rs"
+
+[dependencies]
+smithay-client-toolkit = "0.19.2"
+wayland-client = "0.31"
+portable-pty = "0.8"
+vte = "0.13"
+ab_glyph = "0.2"
+libc = "0.2"

@@ -3,7 +3,7 @@ mod texture;
 use ash::{Entry, Instance, khr, vk};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::mem::offset_of;
-use texture::Texture;
+use texture::{PendingUpload, Texture};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -81,6 +81,7 @@ pub struct Renderer {
     vertex_ptr: *mut u8,
     draws: Vec<DrawCall>,
     textures: Vec<Texture>,
+    pending_uploads: Vec<PendingUpload>,
     pub images: Vec<vk::Image>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
@@ -572,12 +573,15 @@ impl GpuContext {
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
         let in_flight = unsafe { device.create_fence(&fence_info, None)? };
 
+        let mut pending_uploads: Vec<PendingUpload> = Vec::new();
+
         let (tex_w, tex_h, tex_pixels) = checker_pixels();
         let texture = Texture::new(
             &device,
             &mem_props,
             queue,
             command_pool,
+            &mut pending_uploads,
             set_layout,
             tex_w,
             tex_h,
@@ -606,6 +610,7 @@ impl GpuContext {
             vertex_ptr: storage.ptr,
             draws: Vec::new(),
             textures: vec![texture],
+            pending_uploads,
             images: parts.images,
             format: parts.format,
             extent: parts.extent,
@@ -623,6 +628,7 @@ impl Renderer {
             &self.mem_props,
             self.queue,
             self.command_pool,
+            &mut self.pending_uploads,
             self.set_layout,
             width,
             height,
@@ -645,38 +651,37 @@ impl Renderer {
             .map(|t| t.width == width && t.height == height)
             .ok_or("unknown texture id")?;
 
-        unsafe {
-            self.device
-                .wait_for_fences(&[self.in_flight], true, u64::MAX)?
-        };
-
         if same_size {
             return self.textures[id.0].update(
                 &self.device,
                 &self.mem_props,
                 self.queue,
                 self.command_pool,
+                &mut self.pending_uploads,
                 pixels,
             );
         }
 
+        unsafe { self.device.device_wait_idle()? };
         let fresh = Texture::new(
             &self.device,
             &self.mem_props,
             self.queue,
             self.command_pool,
+            &mut self.pending_uploads,
             self.set_layout,
             width,
             height,
             pixels,
         )?;
-        unsafe { self.device.device_wait_idle()? };
         let old = std::mem::replace(&mut self.textures[id.0], fresh);
         old.destroy(&self.device);
         Ok(())
     }
 
     pub fn set_scene(&mut self, vertices: &[Vertex], draws: &[DrawCall]) -> Result<()> {
+        texture::reap_pending(&self.device, self.command_pool, &mut self.pending_uploads);
+
         if vertices.len() > MAX_VERTICES {
             return Err("too many vertices for the vertex buffer".into());
         }
@@ -877,6 +882,12 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            for p in self.pending_uploads.drain(..) {
+                self.device.destroy_fence(p.fence, None);
+                self.device.destroy_buffer(p.staging, None);
+                self.device.free_memory(p.staging_memory, None);
+                self.device.free_command_buffers(self.command_pool, &[p.command_buffer]);
+            }
             for texture in &self.textures {
                 texture.destroy(&self.device);
             }
